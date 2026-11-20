@@ -4,11 +4,14 @@ Turn university syllabus documents into unit-by-unit YouTube study roadmaps.
 
 ## Screenshots
 
-<!-- Light Mode Screenshot Placeholder -->
-<!-- ![SyllabusTube Light Mode](docs/screenshots/light-mode.png) -->
+### Light Mode
+![SyllabusTube Light Mode](docs/screenshots/light-mode.png)
 
-<!-- Dark Mode Screenshot Placeholder -->
-<!-- ![SyllabusTube Dark Mode](docs/screenshots/dark-mode.png) -->
+### Dark Mode
+![SyllabusTube Dark Mode](docs/screenshots/dark-mode.png)
+
+### Search & Ranking Preferences
+![SyllabusTube Search Preferences](docs/screenshots/search-preferences.png)
 
 ## Features
 
