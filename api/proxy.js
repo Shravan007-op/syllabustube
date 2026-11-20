@@ -12,12 +12,21 @@ export default async function handler(req, res) {
     'https://script.google.com/macros/s/AKfycbwPiLzm4X9unGh8YmHeKUIs-XE9O6Jq6E5q239LNTVE9uNOjt7QQY5A4OTxYbCb7exy/exec';
 
   try {
+    let bodyToSend;
+    if (typeof req.body === 'string') {
+      bodyToSend = req.body;
+    } else if (req.body && typeof req.body === 'object') {
+      bodyToSend = JSON.stringify(req.body);
+    } else {
+      bodyToSend = '{}';
+    }
+
     const response = await fetch(scriptUrl, {
       method: 'POST',
       headers: {
         'Content-Type': 'text/plain;charset=utf-8',
       },
-      body: JSON.stringify(req.body),
+      body: bodyToSend,
       redirect: 'follow',
     });
 
