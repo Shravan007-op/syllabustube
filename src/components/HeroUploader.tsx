@@ -1,17 +1,18 @@
-import { useRef, useState, DragEvent, ChangeEvent } from 'react';
+import { ChangeEvent, DragEvent, useRef, useState } from 'react';
 import {
-  UploadCloud,
-  FileText,
-  Image as ImageIcon,
-  X,
   AlertCircle,
   ArrowRight,
-  Type,
-  Loader2,
-  CheckCircle2,
   Ban,
+  CheckCircle2,
+  FileText,
+  Image as ImageIcon,
+  RotateCcw,
+  Type,
+  Upload,
+  X,
 } from 'lucide-react';
-import {
+import { APP_CONFIG, resolveUserError, UserFriendlyError } from '../config';
+import type {
   ExtractionProgress,
   ExtractionResult,
   ExtractionStatus,
@@ -35,28 +36,14 @@ interface HeroUploaderProps {
   onManualTextChange: (text: string) => void;
   uploadError: string | null;
   onUploadError: (error: string | null) => void;
-  isAnalysing: boolean;
-  onContinueToAnalysis: () => void;
+  isProcessing: boolean;
+  onSubmit: () => void;
 }
 
 function formatFileSize(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
-  return `${(bytes / (1024 * 1024)).toFixed(2)} MB`;
-}
-
-function formatMethodLabel(meta: Omit<ExtractionResult, 'text'>): string {
-  const pages = `${meta.pageCount} ${meta.pageCount === 1 ? 'page' : 'pages'}`;
-  switch (meta.method) {
-    case 'pdf-text':
-      return `PDF Text Extraction · ${pages}`;
-    case 'pdf-ocr':
-      return `Scanned PDF OCR · ${pages}`;
-    case 'pdf-hybrid':
-      return `PDF Text (${meta.textPages}) + OCR (${meta.ocrPages}) · ${pages}`;
-    case 'image-ocr':
-      return `Image OCR · ${pages}`;
-  }
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
 export function HeroUploader({
@@ -75,8 +62,8 @@ export function HeroUploader({
   onManualTextChange,
   uploadError,
   onUploadError,
-  isAnalysing,
-  onContinueToAnalysis,
+  isProcessing,
+  onSubmit,
 }: HeroUploaderProps) {
   const [isDragging, setIsDragging] = useState(false);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
@@ -107,359 +94,274 @@ export function HeroUploader({
       extractionStatus === 'empty' ||
       extractionStatus === 'cancelled');
 
+  const resolvedError: UserFriendlyError | null = uploadError
+    ? resolveUserError(uploadError)
+    : null;
+
   return (
-    <section
-      id="upload-section"
-      className="border-b border-slate-200 bg-gradient-to-b from-slate-50/80 via-white to-white py-14 sm:py-20 lg:py-24"
-    >
-      <div className="mx-auto max-w-5xl px-4 sm:px-6 lg:px-8">
-        {/* Hero Title & Subtitle */}
-        <div className="mx-auto max-w-3xl text-center">
-          <h1
-            className="text-3xl sm:text-4xl lg:text-5xl font-bold tracking-tight text-[#0B1528]"
-            style={{ textWrap: 'balance' }}
-          >
-            Turn Your Syllabus Into a Learning Roadmap.
-          </h1>
-          <p className="mt-4 text-base sm:text-lg text-slate-600 leading-relaxed max-w-2xl mx-auto">
-            Upload your university syllabus as a PDF, JPG, or PNG — or enter your course
-            topics directly — to find structured YouTube video lectures for every unit.
-          </p>
-        </div>
-
-        {/* Prominent Upload & Text Entry Workspace */}
-        <div className="mt-10 sm:mt-12 overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-md">
-          {/* Dark Navy Structural Header Strip */}
-          <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4 bg-[#0F1E3D] px-6 py-4 sm:px-8">
-            <div
-              role="tablist"
-              aria-label="Syllabus input method"
-              className="inline-flex rounded-lg bg-[#192D57] p-1 self-start"
+    <section className="py-6 sm:py-8 max-w-4xl mx-auto px-4 sm:px-6">
+      <div className="rounded-lg border border-border-subtle bg-surface">
+        {/* Compact Mode Switcher Header */}
+        <div className="flex items-center justify-between border-b border-border-subtle px-4 py-3 bg-surface-muted/40">
+          <div role="tablist" aria-label="Input mode" className="flex items-center gap-1 bg-surface-muted p-1 rounded-md border border-border-subtle">
+            <button
+              type="button"
+              role="tab"
+              aria-selected={inputMode === 'upload'}
+              onClick={() => {
+                onInputModeChange('upload');
+                onUploadError(null);
+              }}
+              className={`inline-flex items-center gap-1.5 rounded px-3 py-1.5 text-xs font-medium transition-colors cursor-pointer ${
+                inputMode === 'upload'
+                  ? 'bg-surface text-text-main shadow-xs'
+                  : 'text-text-muted hover:text-text-main'
+              }`}
             >
-              <button
-                type="button"
-                role="tab"
-                aria-selected={inputMode === 'upload'}
-                onClick={() => {
-                  onInputModeChange('upload');
-                  onUploadError(null);
-                }}
-                className={`inline-flex items-center gap-2 rounded-md px-4 py-2 text-sm font-medium transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
-                  inputMode === 'upload'
-                    ? 'bg-white text-[#0B1528] shadow-xs'
-                    : 'text-slate-200 hover:text-white'
-                }`}
-              >
-                <UploadCloud className="h-4 w-4" />
-                <span>Upload Syllabus File</span>
-              </button>
-              <button
-                type="button"
-                role="tab"
-                aria-selected={inputMode === 'manual'}
-                onClick={() => {
-                  onInputModeChange('manual');
-                  onUploadError(null);
-                }}
-                className={`inline-flex items-center gap-2 rounded-md px-4 py-2 text-sm font-medium transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
-                  inputMode === 'manual'
-                    ? 'bg-white text-[#0B1528] shadow-xs'
-                    : 'text-slate-200 hover:text-white'
-                }`}
-              >
-                <Type className="h-4 w-4" />
-                <span>Enter Syllabus Text</span>
-              </button>
-            </div>
-
-            <span className="text-xs font-medium text-slate-300 whitespace-nowrap">
-              Local Browser Extraction · PDF, JPG, JPEG, PNG
-            </span>
+              <Upload className="h-3.5 w-3.5" strokeWidth={1.75} />
+              <span>Upload Document</span>
+            </button>
+            <button
+              type="button"
+              role="tab"
+              aria-selected={inputMode === 'manual'}
+              onClick={() => {
+                onInputModeChange('manual');
+                onUploadError(null);
+              }}
+              className={`inline-flex items-center gap-1.5 rounded px-3 py-1.5 text-xs font-medium transition-colors cursor-pointer ${
+                inputMode === 'manual'
+                  ? 'bg-surface text-text-main shadow-xs'
+                  : 'text-text-muted hover:text-text-main'
+              }`}
+            >
+              <Type className="h-3.5 w-3.5" strokeWidth={1.75} />
+              <span>Paste Text</span>
+            </button>
           </div>
 
-          <div className="p-6 sm:p-8 lg:p-10">
-            {/* Input Zone */}
+          <span className="text-[11px] text-text-muted hidden sm:inline">
+            Client-side extraction · Max {APP_CONFIG.MAX_FILE_SIZE_MB} MB
+          </span>
+        </div>
+
+        <div className="p-4 sm:p-6 space-y-4">
+          {inputMode === 'upload' ? (
             <div>
-              {inputMode === 'upload' ? (
-                <div className="space-y-6">
-                  <input
-                    ref={fileInputRef}
-                    type="file"
-                    accept=".pdf,.jpg,.jpeg,.png,application/pdf,image/jpeg,image/png"
-                    onChange={handleFileInputChange}
-                    className="sr-only"
-                    id="syllabus-file-input"
-                  />
+              <input
+                ref={fileInputRef}
+                type="file"
+                accept=".pdf,.jpg,.jpeg,.png,application/pdf,image/jpeg,image/png"
+                onChange={handleFileInputChange}
+                className="sr-only"
+                id="syllabus-file-input"
+              />
 
-                  {!uploadedFile ? (
-                    <div
-                      role="button"
-                      tabIndex={0}
-                      onClick={() => fileInputRef.current?.click()}
-                      onKeyDown={(e) => {
-                        if (e.key === 'Enter' || e.key === ' ') {
-                          e.preventDefault();
-                          fileInputRef.current?.click();
-                        }
-                      }}
-                      onDragOver={(e) => {
-                        e.preventDefault();
-                        setIsDragging(true);
-                      }}
-                      onDragLeave={(e) => {
-                        e.preventDefault();
-                        setIsDragging(false);
-                      }}
-                      onDrop={handleDrop}
-                      className={`flex flex-col items-center justify-center rounded-xl border-2 border-dashed px-6 py-16 sm:py-20 text-center transition-colors cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#0F1E3D] ${
-                        isDragging
-                          ? 'border-[#0F1E3D] bg-slate-50'
-                          : 'border-slate-300 bg-slate-50/60 hover:border-[#0F1E3D] hover:bg-slate-50'
-                      }`}
-                    >
-                      <div className="flex h-14 w-14 items-center justify-center rounded-xl bg-[#0F1E3D] text-white shadow-xs">
-                        <UploadCloud className="h-7 w-7" />
-                      </div>
-                      <p className="mt-5 text-base sm:text-lg font-semibold text-[#0B1528]">
-                        Drag and drop your syllabus here, or{' '}
-                        <span className="text-[#1D4ED8] underline underline-offset-4">
-                          browse files
-                        </span>
-                      </p>
-                      <p className="mt-2 text-sm text-slate-500">
-                        Accepted formats: PDF, JPG, JPEG, PNG · Maximum size 20 MB
-                      </p>
-                    </div>
-                  ) : (
-                    <>
-                      {/* Uploaded Document Metadata Bar */}
-                      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 rounded-xl border border-slate-200 bg-slate-50 p-5">
-                        <div className="flex items-center gap-4 min-w-0">
-                          <div className="flex h-12 w-12 shrink-0 items-center justify-center rounded-lg bg-[#0F1E3D] text-white">
-                            {uploadedFile.extension === 'PDF' ? (
-                              <FileText className="h-6 w-6" />
-                            ) : (
-                              <ImageIcon className="h-6 w-6" />
-                            )}
-                          </div>
-                          <div className="min-w-0">
-                            <p className="truncate text-sm font-semibold text-[#0B1528]">
-                              {uploadedFile.name}
-                            </p>
-                            <p className="mt-0.5 text-xs text-slate-600 tabular-nums">
-                              {uploadedFile.extension} · {formatFileSize(uploadedFile.sizeBytes)}
-                              {extractionMeta ? ` · ${formatMethodLabel(extractionMeta)}` : ''}
-                            </p>
-                          </div>
-                        </div>
-
-                        <div className="flex flex-wrap items-center gap-2 shrink-0">
-                          {isExtracting ? (
-                            <button
-                              type="button"
-                              onClick={onCancelExtraction}
-                              className="inline-flex items-center gap-1.5 rounded-lg border border-red-200 bg-white px-3.5 py-2 text-xs font-semibold text-red-700 hover:bg-red-50 transition-colors cursor-pointer whitespace-nowrap"
-                            >
-                              <Ban className="h-3.5 w-3.5" />
-                              <span>Cancel Processing</span>
-                            </button>
-                          ) : (
-                            <>
-                              <button
-                                type="button"
-                                onClick={() => fileInputRef.current?.click()}
-                                className="rounded-lg border border-slate-200 bg-white px-3.5 py-2 text-xs font-medium text-slate-700 hover:bg-slate-100 transition-colors cursor-pointer whitespace-nowrap"
-                              >
-                                Replace File
-                              </button>
-                              <button
-                                type="button"
-                                onClick={onClearDocument}
-                                className="inline-flex items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-3.5 py-2 text-xs font-medium text-slate-700 hover:border-red-200 hover:text-red-700 transition-colors cursor-pointer whitespace-nowrap"
-                              >
-                                <X className="h-3.5 w-3.5" />
-                                <span>Clear Document</span>
-                              </button>
-                            </>
-                          )}
-                        </div>
-                      </div>
-
-                      {/* Extraction Processing Indicator & Progress Bar */}
-                      {isExtracting && (
-                        <div
-                          role="status"
-                          aria-live="polite"
-                          className="rounded-xl border border-slate-200 bg-white p-5 sm:p-6"
-                        >
-                          <div className="flex items-center justify-between gap-4">
-                            <div className="flex items-center gap-3 min-w-0">
-                              <Loader2 className="h-5 w-5 animate-spin text-[#0F1E3D] shrink-0" />
-                              <div className="min-w-0">
-                                <p className="text-sm font-semibold text-[#0B1528] truncate">
-                                  {extractionProgress.stage}
-                                </p>
-                                <p className="text-xs text-slate-500">
-                                  Running locally in your browser — document is never uploaded to external servers.
-                                </p>
-                              </div>
-                            </div>
-                            <span className="font-mono text-sm font-semibold text-[#0F1E3D] tabular-nums shrink-0">
-                              {extractionProgress.percent}%
-                            </span>
-                          </div>
-
-                          <div className="mt-4 h-2 w-full overflow-hidden rounded-full bg-slate-100">
-                            <div
-                              className="h-full bg-[#0F1E3D] transition-all duration-200"
-                              style={{ width: `${extractionProgress.percent}%` }}
-                            />
-                          </div>
-                        </div>
-                      )}
-
-                      {/* Editable Extracted Text Area */}
-                      {showExtractedEditor && (
-                        <div className="space-y-3">
-                          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
-                            <div className="flex items-center gap-2">
-                              {extractionStatus === 'completed' && (
-                                <CheckCircle2 className="h-4 w-4 text-emerald-700 shrink-0" />
-                              )}
-                              <label
-                                htmlFor="extracted-syllabus-textarea"
-                                className="text-sm font-semibold text-[#0B1528]"
-                              >
-                                Extracted Syllabus Text
-                              </label>
-                            </div>
-                            <span className="text-xs text-slate-500 tabular-nums">
-                              {extractedText.length.toLocaleString()} characters · Editable for OCR corrections
-                            </span>
-                          </div>
-
-                          {extractionStatus === 'empty' && (
-                            <div
-                              role="status"
-                              className="flex items-start gap-3 rounded-lg border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-900"
-                            >
-                              <AlertCircle className="h-4 w-4 mt-0.5 shrink-0 text-amber-700" />
-                              <span>
-                                No readable text was detected in this document. It may be blank, too blurry, or handwritten. You can type or paste your syllabus below, or clear and try a clearer scan.
-                              </span>
-                            </div>
-                          )}
-
-                          {extractionStatus === 'cancelled' && (
-                            <div
-                              role="status"
-                              className="flex items-start gap-3 rounded-lg border border-slate-200 bg-slate-50 px-4 py-3 text-sm text-slate-700"
-                            >
-                              <AlertCircle className="h-4 w-4 mt-0.5 shrink-0 text-slate-600" />
-                              <span>
-                                Document extraction was cancelled. You can enter syllabus text below, replace the file, or clear the document.
-                              </span>
-                            </div>
-                          )}
-
-                          <textarea
-                            id="extracted-syllabus-textarea"
-                            rows={10}
-                            value={extractedText}
-                            onChange={(e) => {
-                              onExtractedTextChange(e.target.value);
-                              if (uploadError) onUploadError(null);
-                            }}
-                            placeholder="Extracted syllabus text will appear here. Review unit headings and fix any OCR typos before continuing..."
-                            className="w-full rounded-xl border border-slate-300 bg-white px-4 py-3.5 text-sm text-[#0B1528] placeholder:text-slate-400 focus:border-[#0F1E3D] focus:outline-none focus:ring-2 focus:ring-[#0F1E3D]/20 leading-relaxed"
-                          />
-                        </div>
-                      )}
-                    </>
-                  )}
-                </div>
-              ) : (
-                <div>
-                  <div className="flex items-center justify-between mb-2.5">
-                    <label
-                      htmlFor="manual-syllabus-textarea"
-                      className="text-sm font-semibold text-[#0B1528]"
-                    >
-                      Paste or type your syllabus units and topics
-                    </label>
-                    {manualText.trim().length > 0 && (
-                      <button
-                        type="button"
-                        onClick={() => onManualTextChange('')}
-                        className="text-xs font-medium text-slate-500 hover:text-[#0B1528] cursor-pointer"
-                      >
-                        Clear text
-                      </button>
-                    )}
+              {!uploadedFile ? (
+                <div
+                  role="button"
+                  tabIndex={0}
+                  onClick={() => fileInputRef.current?.click()}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter' || e.key === ' ') {
+                      e.preventDefault();
+                      fileInputRef.current?.click();
+                    }
+                  }}
+                  onDragOver={(e) => {
+                    e.preventDefault();
+                    setIsDragging(true);
+                  }}
+                  onDragLeave={(e) => {
+                    e.preventDefault();
+                    setIsDragging(false);
+                  }}
+                  onDrop={handleDrop}
+                  className={`flex flex-col items-center justify-center rounded-md border border-dashed py-12 px-4 text-center transition-colors cursor-pointer ${
+                    isDragging
+                      ? 'border-accent bg-accent-subtle/30'
+                      : 'border-border-strong bg-surface-muted/30 hover:border-text-muted hover:bg-surface-muted/60'
+                  }`}
+                >
+                  <div className="flex h-10 w-10 items-center justify-center rounded-md bg-surface border border-border-subtle text-text-muted">
+                    <Upload className="h-5 w-5" strokeWidth={1.75} />
                   </div>
-                  <textarea
-                    id="manual-syllabus-textarea"
-                    rows={8}
-                    value={manualText}
-                    onChange={(e) => {
-                      onManualTextChange(e.target.value);
-                      if (uploadError) onUploadError(null);
-                    }}
-                    placeholder="Enter your subject title, units, and syllabus topics here (one topic per line)..."
-                    className="w-full rounded-xl border border-slate-300 bg-white px-4 py-3.5 text-sm text-[#0B1528] placeholder:text-slate-400 focus:border-[#0F1E3D] focus:outline-none focus:ring-2 focus:ring-[#0F1E3D]/20 leading-relaxed"
-                  />
-                  <p className="mt-2.5 text-xs text-slate-500">
-                    Tip: Start unit headings with &ldquo;Unit 1:&rdquo; followed by topic lines to organise your results automatically.
+                  <p className="mt-3 text-sm font-medium text-text-main">
+                    Drop syllabus PDF or image here, or <span className="text-accent underline underline-offset-2">browse</span>
+                  </p>
+                  <p className="mt-1 text-xs text-text-muted">
+                    Supported: PDF, JPG, PNG · Up to {APP_CONFIG.MAX_FILE_SIZE_MB} MB / {APP_CONFIG.MAX_PDF_PAGES} pages
                   </p>
                 </div>
-              )}
+              ) : (
+                <div className="space-y-4">
+                  {/* File Metadata Bar */}
+                  <div className="flex items-center justify-between gap-3 rounded-md border border-border-subtle bg-surface-muted/40 p-3">
+                    <div className="flex items-center gap-2.5 min-w-0">
+                      <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded bg-surface border border-border-subtle text-text-muted">
+                        {uploadedFile.extension === 'PDF' ? (
+                          <FileText className="h-4 w-4" strokeWidth={1.75} />
+                        ) : (
+                          <ImageIcon className="h-4 w-4" strokeWidth={1.75} />
+                        )}
+                      </div>
+                      <div className="min-w-0">
+                        <p className="truncate text-xs font-medium text-text-main">
+                          {uploadedFile.name}
+                        </p>
+                        <p className="text-[11px] text-text-muted font-mono tabular-nums">
+                          {uploadedFile.extension} · {formatFileSize(uploadedFile.sizeBytes)}
+                          {extractionMeta ? ` · ${extractionMeta.pageCount} page(s)` : ''}
+                        </p>
+                      </div>
+                    </div>
 
-              {/* Inline Validation / Upload Error Banner */}
-              {uploadError && (
-                <div
-                  role="alert"
-                  className="mt-4 flex items-start gap-3 rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-800"
-                >
-                  <AlertCircle className="h-4 w-4 mt-0.5 shrink-0 text-red-600" />
-                  <span>{uploadError}</span>
+                    <div className="flex items-center gap-1.5 shrink-0">
+                      {isExtracting ? (
+                        <button
+                          type="button"
+                          onClick={onCancelExtraction}
+                          className="inline-flex items-center gap-1 rounded border border-error-border bg-error-bg/70 px-2 py-1 text-xs font-medium text-error-text hover:bg-error-bg transition-colors cursor-pointer"
+                        >
+                          <Ban className="h-3 w-3" strokeWidth={1.75} />
+                          <span>Cancel</span>
+                        </button>
+                      ) : (
+                        <>
+                          <button
+                            type="button"
+                            onClick={() => fileInputRef.current?.click()}
+                            className="rounded border border-border-subtle bg-surface px-2.5 py-1 text-xs font-medium text-text-muted hover:border-border-strong hover:text-text-main transition-colors cursor-pointer"
+                          >
+                            Replace
+                          </button>
+                          <button
+                            type="button"
+                            onClick={onClearDocument}
+                            aria-label="Remove document"
+                            className="rounded border border-border-subtle bg-surface p-1 text-text-muted hover:border-error-border hover:text-error-text transition-colors cursor-pointer"
+                          >
+                            <X className="h-3.5 w-3.5" strokeWidth={1.75} />
+                          </button>
+                        </>
+                      )}
+                    </div>
+                  </div>
+
+                  {/* Extraction Progress Bar */}
+                  {isExtracting && (
+                    <div className="rounded-md border border-border-subtle bg-surface p-3 space-y-2">
+                      <div className="flex items-center justify-between text-xs">
+                        <span className="text-text-muted">{extractionProgress.stage}</span>
+                        <span className="font-mono tabular-nums text-text-main font-medium">
+                          {extractionProgress.percent}%
+                        </span>
+                      </div>
+                      <div className="h-1.5 w-full overflow-hidden rounded-full bg-surface-muted border border-border-subtle">
+                        <div
+                          className="h-full bg-accent transition-all duration-200"
+                          style={{ width: `${extractionProgress.percent}%` }}
+                        />
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Editable Extracted Text Area */}
+                  {showExtractedEditor && (
+                    <div className="space-y-1.5">
+                      <div className="flex items-center justify-between text-xs">
+                        <label htmlFor="extracted-text-area" className="font-medium text-text-main flex items-center gap-1">
+                          {extractionStatus === 'completed' && (
+                            <CheckCircle2 className="h-3.5 w-3.5 text-emerald-600 dark:text-emerald-400" strokeWidth={1.75} />
+                          )}
+                          <span>Extracted Syllabus Content</span>
+                        </label>
+                        <span className="text-text-muted font-mono tabular-nums">
+                          {extractedText.length.toLocaleString()} characters
+                        </span>
+                      </div>
+
+                      <textarea
+                        id="extracted-text-area"
+                        rows={7}
+                        value={extractedText}
+                        onChange={(e) => {
+                          onExtractedTextChange(e.target.value);
+                          if (uploadError) onUploadError(null);
+                        }}
+                        placeholder="Extracted syllabus text appears here. You can edit unit headings or fix typos directly..."
+                        className="w-full rounded-md border border-border-subtle bg-surface p-3 font-mono text-xs text-text-main leading-relaxed focus:border-accent focus:outline-none placeholder:text-text-subtle"
+                      />
+                    </div>
+                  )}
                 </div>
               )}
             </div>
-
-            {/* Primary Action Row */}
-            <div className="mt-7 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4 pt-6 border-t border-slate-100">
-              <p className="text-xs text-slate-500">
-                All PDF and OCR processing runs privately inside your browser.
-              </p>
-
-              <div className="flex flex-wrap items-center gap-3 shrink-0">
-                {inputMode === 'upload' && uploadedFile && !isExtracting && (
+          ) : (
+            <div className="space-y-1.5">
+              <div className="flex items-center justify-between text-xs">
+                <label htmlFor="manual-syllabus-text" className="font-medium text-text-main">
+                  Course Syllabus Text
+                </label>
+                {manualText.length > 0 && (
                   <button
                     type="button"
-                    onClick={onClearDocument}
-                    className="rounded-lg border border-slate-200 bg-white px-5 py-3.5 text-sm font-medium text-slate-700 hover:bg-slate-50 transition-colors whitespace-nowrap cursor-pointer"
+                    onClick={() => onManualTextChange('')}
+                    className="text-text-muted hover:text-text-main cursor-pointer"
                   >
-                    Clear Document
+                    Clear
                   </button>
                 )}
+              </div>
 
-                <button
-                  type="button"
-                  onClick={onContinueToAnalysis}
-                  disabled={isAnalysing || isExtracting}
-                  className="inline-flex items-center justify-center gap-2 rounded-lg bg-[#0F1E3D] px-7 py-3.5 text-sm font-semibold text-white hover:bg-[#162B54] disabled:opacity-50 transition-colors whitespace-nowrap shrink-0 cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#0F1E3D] focus-visible:ring-offset-2"
-                >
-                  <span>
-                    {isExtracting
-                      ? 'Extracting Text...'
-                      : isAnalysing
-                        ? 'Building Playlist...'
-                        : 'Build Learning Playlist'}
-                  </span>
-                  <ArrowRight className="h-4 w-4" />
-                </button>
+              <textarea
+                id="manual-syllabus-text"
+                rows={8}
+                value={manualText}
+                onChange={(e) => {
+                  onManualTextChange(e.target.value);
+                  if (uploadError) onUploadError(null);
+                }}
+                placeholder="Enter subject name, units, and topics. Example:&#10;&#10;CS301: Data Structures&#10;Unit 1: Linear Data Structures&#10;- Arrays and Linked Lists&#10;- Stacks and Queues&#10;&#10;Unit 2: Trees and Graphs&#10;- Binary Search Trees&#10;- Graph Traversals"
+                className="w-full rounded-md border border-border-subtle bg-surface p-3 font-mono text-xs text-text-main leading-relaxed focus:border-accent focus:outline-none placeholder:text-text-subtle"
+              />
+            </div>
+          )}
+
+          {/* Inline Validation / Error Message */}
+          {resolvedError && (
+            <div
+              role="alert"
+              className="flex items-start gap-2.5 rounded-md border border-error-border bg-error-bg p-3 text-xs text-error-text"
+            >
+              <AlertCircle className="h-4 w-4 mt-0.5 shrink-0" strokeWidth={1.75} />
+              <div className="space-y-0.5 min-w-0">
+                <p className="font-semibold">{resolvedError.title}</p>
+                <p>{resolvedError.message}</p>
+                {resolvedError.action && (
+                  <p className="font-medium opacity-90">{resolvedError.action}</p>
+                )}
               </div>
             </div>
+          )}
+
+          {/* Action Row */}
+          <div className="flex items-center justify-between pt-2 border-t border-border-subtle">
+            <span className="text-xs text-text-muted">
+              {inputMode === 'upload' && uploadedFile
+                ? 'Review text above before structuring'
+                : 'Upload or paste to build roadmap'}
+            </span>
+
+            <button
+              type="button"
+              onClick={onSubmit}
+              disabled={isProcessing || isExtracting}
+              className="inline-flex items-center gap-1.5 rounded-md bg-accent px-4 py-2 text-xs font-semibold text-white hover:bg-accent-hover disabled:opacity-50 transition-colors cursor-pointer focus-visible:outline-none"
+            >
+              <span>{isProcessing ? 'Structuring...' : 'Generate Roadmap'}</span>
+              <ArrowRight className="h-3.5 w-3.5" strokeWidth={1.75} />
+            </button>
           </div>
         </div>
       </div>

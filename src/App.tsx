@@ -1,5 +1,6 @@
-import { useEffect, useRef, useState } from 'react';
-import {
+import { useEffect, useMemo, useRef, useState } from 'react';
+import { APP_CONFIG, resolveUserError, UserFriendlyError } from './config';
+import type {
   AnalysisStage,
   ExtractionProgress,
   ExtractionResult,
@@ -8,6 +9,7 @@ import {
   SearchPreferences,
   StructuredSyllabus,
   StructuredTopic,
+  StructuredUnit,
   TopicVideoSearchState,
   UploadedSyllabusFile,
 } from './types/syllabus';
@@ -25,9 +27,11 @@ import {
 import { Navbar } from './components/Navbar';
 import { HeroUploader } from './components/HeroUploader';
 import { SearchPreferencesPanel } from './components/SearchPreferencesPanel';
-import { StructuredSyllabusReview } from './components/StructuredSyllabusReview';
-import { HowItWorksSection } from './components/HowItWorksSection';
+import { TopicVideoRoadmap } from './components/TopicVideoRoadmap';
+import { Stepper, StepperStageId } from './components/Stepper';
+import { ErrorBoundary } from './components/ErrorBoundary';
 import { Footer } from './components/Footer';
+import { AlertTriangle, RotateCcw, X } from 'lucide-react';
 
 const DEFAULT_PREFERENCES: SearchPreferences = {
   preferredCountry: 'India',
@@ -41,7 +45,7 @@ const DEFAULT_PREFERENCES: SearchPreferences = {
 
 const INITIAL_PROGRESS: ExtractionProgress = {
   percent: 0,
-  stage: 'Preparing document...',
+  stage: 'Reading document...',
 };
 
 export default function App() {
@@ -55,38 +59,41 @@ export default function App() {
     'text'
   > | null>(null);
   const [extractedText, setExtractedText] = useState<string>('');
-
   const [manualText, setManualText] = useState<string>('');
   const [uploadError, setUploadError] = useState<string | null>(null);
 
-  const [preferences, setPreferences] = useState<SearchPreferences>(DEFAULT_PREFERENCES);
+  const [preferences, setPreferences] = useState<SearchPreferences>(() => {
+    try {
+      const saved = localStorage.getItem(APP_CONFIG.STORAGE_KEYS.PREFERENCES);
+      if (saved) return JSON.parse(saved);
+    } catch {}
+    return DEFAULT_PREFERENCES;
+  });
+
   const [analysisStage, setAnalysisStage] = useState<AnalysisStage>('idle');
   const [structuredSyllabus, setStructuredSyllabus] =
     useState<StructuredSyllabus | null>(null);
-  const [confirmedSyllabus, setConfirmedSyllabus] =
-    useState<StructuredSyllabus | null>(null);
-  const [analysisError, setAnalysisError] = useState<string | null>(null);
+  const [analysisError, setAnalysisError] = useState<UserFriendlyError | null>(null);
+  const [transientBannerError, setTransientBannerError] = useState<UserFriendlyError | null>(null);
+
+  // Stepper state
+  const [stepperStage, setStepperStage] = useState<StepperStageId>('reading');
+  const [stepperPercent, setStepperPercent] = useState<number>(0);
+  const [stepperDetail, setStepperDetail] = useState<string>('');
 
   const [topicVideoResults, setTopicVideoResults] = useState<
     Record<string, TopicVideoSearchState>
   >({});
   const [isSearchingVideos, setIsSearchingVideos] = useState<boolean>(false);
   const [configurationNotice, setConfigurationNotice] = useState<string | null>(null);
-  const [preferencesDirtySinceSearch, setPreferencesDirtySinceSearch] =
-    useState<boolean>(false);
 
-  const lastAnalyzedInputRef = useRef<{
-    text: string;
-    sourceFileName?: string;
-    sourceLabel: string;
-  } | null>(null);
+  // Watched state to display top bar overall progress
+  const [watchedTrigger, setWatchedTrigger] = useState<number>(0);
 
   const extractionAbortRef = useRef<AbortController | null>(null);
   const extractionCleanupRef = useRef<(() => void) | null>(null);
   const analysisAbortRef = useRef<AbortController | null>(null);
-  const analysisInFlightRef = useRef<boolean>(false);
   const videoSearchAbortRef = useRef<AbortController | null>(null);
-  const videoSearchSessionRef = useRef<number>(0);
 
   useEffect(() => {
     return () => {
@@ -97,35 +104,67 @@ export default function App() {
     };
   }, []);
 
-  const scrollToSection = (id: string) => {
-    const el = document.getElementById(id);
-    if (el) {
-      el.scrollIntoView({ behavior: 'smooth', block: 'start' });
-    }
+  const handlePreferencesChange = (next: SearchPreferences) => {
+    setPreferences(next);
+    try {
+      localStorage.setItem(APP_CONFIG.STORAGE_KEYS.PREFERENCES, JSON.stringify(next));
+    } catch {}
   };
 
-  const abortActiveExtraction = () => {
+  const handleResetPreferences = () => {
+    setPreferences(DEFAULT_PREFERENCES);
+    try {
+      localStorage.removeItem(APP_CONFIG.STORAGE_KEYS.PREFERENCES);
+    } catch {}
+  };
+
+  const abortAllOperations = () => {
     extractionAbortRef.current?.abort();
     extractionAbortRef.current = null;
     extractionCleanupRef.current?.();
     extractionCleanupRef.current = null;
+
+    analysisAbortRef.current?.abort();
+    analysisAbortRef.current = null;
+
+    videoSearchAbortRef.current?.abort();
+    videoSearchAbortRef.current = null;
+
+    setIsSearchingVideos(false);
   };
 
   const handleClearDocument = () => {
-    abortActiveExtraction();
+    abortAllOperations();
     setUploadedFile(null);
     setExtractionStatus('idle');
     setExtractionProgress(INITIAL_PROGRESS);
     setExtractionMeta(null);
     setExtractedText('');
     setUploadError(null);
+    setAnalysisError(null);
+    setTransientBannerError(null);
   };
 
-  const handleCancelExtraction = () => {
-    abortActiveExtraction();
+  const handleResetSyllabus = () => {
+    abortAllOperations();
+    setStructuredSyllabus(null);
+    setTopicVideoResults({});
+    setAnalysisStage('idle');
+    setAnalysisError(null);
+    setTransientBannerError(null);
+    handleClearDocument();
+  };
+
+  const handleCancelActiveProcess = () => {
+    abortAllOperations();
     setExtractionStatus('cancelled');
-    setExtractionProgress(INITIAL_PROGRESS);
-    setUploadError(null);
+    setAnalysisStage('idle');
+    setTransientBannerError({
+      code: 'ABORTED',
+      title: 'Cancelled',
+      message: 'Processing was stopped by the user.',
+      action: 'You can modify your syllabus text and restart anytime.',
+    });
   };
 
   const handleFileUploadStart = async (file: File) => {
@@ -135,10 +174,12 @@ export default function App() {
       return;
     }
 
-    abortActiveExtraction();
+    abortAllOperations();
 
     const ext = file.name.split('.').pop()?.toUpperCase() ?? 'FILE';
     setUploadError(null);
+    setAnalysisError(null);
+    setTransientBannerError(null);
     setUploadedFile({
       name: file.name,
       sizeBytes: file.size,
@@ -148,7 +189,7 @@ export default function App() {
     setExtractionMeta(null);
     setExtractedText('');
     setExtractionStatus('extracting');
-    setExtractionProgress({ percent: 4, stage: 'Preparing document extraction...' });
+    setExtractionProgress({ percent: 5, stage: 'Reading document...' });
 
     const controller = new AbortController();
     extractionAbortRef.current = controller;
@@ -178,6 +219,7 @@ export default function App() {
 
       if (countMeaningfulChars(result.text) === 0) {
         setExtractionStatus('empty');
+        setUploadError('No readable text was detected in this document. Please verify the scan is clear or paste text.');
       } else {
         setExtractionStatus('completed');
       }
@@ -186,13 +228,9 @@ export default function App() {
         setExtractionStatus('cancelled');
         return;
       }
-
-      const friendlyMessage =
-        err instanceof Error
-          ? err.message
-          : 'Unable to extract text from this file. Please verify the file is not corrupted.';
+      const userErr = resolveUserError(err);
       setExtractionStatus('error');
-      setUploadError(friendlyMessage);
+      setUploadError(userErr.message);
     } finally {
       if (extractionAbortRef.current === controller) {
         extractionAbortRef.current = null;
@@ -201,21 +239,16 @@ export default function App() {
     }
   };
 
-  const abortActiveVideoSearch = () => {
-    videoSearchSessionRef.current += 1;
-    videoSearchAbortRef.current?.abort();
-    videoSearchAbortRef.current = null;
-    setIsSearchingVideos(false);
-  };
-
+  /**
+   * Searches videos for a single topic
+   */
   const fetchVideosForTopic = async (
     subject: string,
     topic: StructuredTopic,
     prefs: SearchPreferences,
-    signal: AbortSignal,
-    sessionId: number
+    signal: AbortSignal
   ) => {
-    if (signal.aborted || videoSearchSessionRef.current !== sessionId) return;
+    if (signal.aborted) return;
 
     setTopicVideoResults((prev) => ({
       ...prev,
@@ -225,8 +258,8 @@ export default function App() {
       },
     }));
 
-    const attemptSearch = () =>
-      searchTopicVideosWithAppsScript(
+    try {
+      const result = await searchTopicVideosWithAppsScript(
         {
           subject,
           topicName: topic.topicName,
@@ -236,24 +269,7 @@ export default function App() {
         { signal }
       );
 
-    try {
-      let result;
-      try {
-        result = await attemptSearch();
-      } catch (firstErr) {
-        const errCode =
-          firstErr && typeof firstErr === 'object' && 'code' in firstErr
-            ? String((firstErr as { code?: unknown }).code)
-            : '';
-        if (errCode === 'REQUEST_BUSY' && !signal.aborted) {
-          await new Promise((resolve) => setTimeout(resolve, 600));
-          result = await attemptSearch();
-        } else {
-          throw firstErr;
-        }
-      }
-
-      if (signal.aborted || videoSearchSessionRef.current !== sessionId) return;
+      if (signal.aborted) return;
 
       setTopicVideoResults((prev) => ({
         ...prev,
@@ -266,371 +282,305 @@ export default function App() {
       }));
     } catch (err) {
       if (isAbortError(err) || signal.aborted) {
-        if (videoSearchSessionRef.current === sessionId) {
-          setTopicVideoResults((prev) => ({
-            ...prev,
-            [topic.id]:
-              prev[topic.id]?.videos && prev[topic.id].videos.length > 0
-                ? { ...prev[topic.id], status: 'loaded' }
-                : { status: 'idle', videos: [] },
-          }));
-        }
         return;
       }
-
-      if (videoSearchSessionRef.current !== sessionId) return;
-
-      const message =
-        err instanceof Error
-          ? err.message
-          : 'Failed to search YouTube videos for this topic.';
-      const errCode =
-        err && typeof err === 'object' && 'code' in err
-          ? String((err as { code?: unknown }).code)
-          : '';
-
-      if (
-        errCode === 'ENDPOINT_NOT_CONFIGURED' ||
-        errCode === 'SERVER_NOT_CONFIGURED' ||
-        errCode === 'YOUTUBE_AUTH_ERROR'
-      ) {
-        setConfigurationNotice(message);
-        videoSearchAbortRef.current?.abort();
+      const userErr = resolveUserError(err);
+      if (userErr.code === 'QUOTA_EXCEEDED' || userErr.code === 'RATE_LIMITED') {
+        setConfigurationNotice(userErr.message);
       }
-
       setTopicVideoResults((prev) => ({
         ...prev,
         [topic.id]: {
           status: 'error',
           videos: [],
-          errorMessage: message,
-          errorCode: errCode,
+          errorMessage: userErr.message,
+          errorCode: userErr.code,
         },
       }));
     }
   };
 
-  const runTopicWiseVideoSearch = async (
-    syllabusToSearch: StructuredSyllabus,
-    prefsToUse: SearchPreferences
-  ) => {
-    abortActiveVideoSearch();
-    setConfigurationNotice(null);
+  /**
+   * Lazy-loads videos for all topics in a specific unit
+   */
+  const handleSearchUnitTopics = async (unit: StructuredUnit) => {
+    if (!structuredSyllabus || !isAppsScriptConfigured()) return;
 
-    if (!isAppsScriptConfigured()) {
-      setTopicVideoResults({});
-      setPreferencesDirtySinceSearch(false);
-      setIsSearchingVideos(false);
-      return;
-    }
-
-    const sessionId = videoSearchSessionRef.current;
     const controller = new AbortController();
     videoSearchAbortRef.current = controller;
-
-    const allTopics = syllabusToSearch.units.flatMap((u) => u.topics);
-    if (allTopics.length === 0) return;
-
-    const initialMap: Record<string, TopicVideoSearchState> = {};
-    for (const topic of allTopics) {
-      initialMap[topic.id] = { status: 'idle', videos: [] };
-    }
-    setTopicVideoResults(initialMap);
-    setPreferencesDirtySinceSearch(false);
     setIsSearchingVideos(true);
 
-    let cursor = 0;
-    const workerCount = Math.min(2, allTopics.length);
-
-    const runWorker = async () => {
-      while (
-        cursor < allTopics.length &&
-        !controller.signal.aborted &&
-        videoSearchSessionRef.current === sessionId
-      ) {
-        const nextIndex = cursor;
-        cursor += 1;
-        const topic = allTopics[nextIndex];
+    try {
+      for (const topic of unit.topics) {
+        if (controller.signal.aborted) break;
         await fetchVideosForTopic(
-          syllabusToSearch.subject,
+          structuredSyllabus.subject,
           topic,
-          prefsToUse,
-          controller.signal,
-          sessionId
+          preferences,
+          controller.signal
         );
       }
-    };
-
-    try {
-      await Promise.all(Array.from({ length: workerCount }, () => runWorker()));
     } finally {
-      if (videoSearchSessionRef.current === sessionId) {
-        setIsSearchingVideos(false);
-        if (videoSearchAbortRef.current === controller) {
-          videoSearchAbortRef.current = null;
-        }
-      }
+      setIsSearchingVideos(false);
     }
   };
 
-  const runGeminiAnalysis = async (params: {
-    text: string;
-    sourceFileName?: string;
-    sourceLabel: string;
-  }) => {
-    // Prevent duplicate concurrent Gemini API requests
-    if (analysisInFlightRef.current) {
+  /**
+   * Runs structuring with AI and progressive rendering
+   */
+  const handleStartAnalysis = async () => {
+    const rawText = inputMode === 'upload' ? extractedText.trim() : manualText.trim();
+    if (!rawText || countMeaningfulChars(rawText) < APP_CONFIG.MIN_MEANINGFUL_CHARS) {
+      setUploadError('Syllabus text is too short. Please upload a document or paste your syllabus content.');
       return;
     }
 
-    abortActiveVideoSearch();
-    analysisInFlightRef.current = true;
-    analysisAbortRef.current?.abort();
+    abortAllOperations();
+    setUploadError(null);
+    setAnalysisError(null);
+    setTransientBannerError(null);
+    setAnalysisStage('analysing');
+
+    // Stepper setup
+    setStepperStage('structuring');
+    setStepperPercent(10);
+    setStepperDetail('Preparing text chunks for AI structuring...');
+
     const controller = new AbortController();
     analysisAbortRef.current = controller;
 
-    lastAnalyzedInputRef.current = params;
-    setAnalysisError(null);
-    setConfigurationNotice(null);
-    setAnalysisStage('analysing');
-    scrollToSection('roadmap-section');
-
     try {
-      const structured = await analyzeSyllabusViaApi(params.text, {
-        sourceFileName: params.sourceFileName,
-        sourceLabel: params.sourceLabel,
+      const sourceFileName = uploadedFile?.name;
+      const sourceLabel = sourceFileName
+        ? `Document · ${sourceFileName}`
+        : 'Manual Syllabus Entry';
+
+      const structured = await analyzeSyllabusViaApi(rawText, {
+        sourceFileName,
+        sourceLabel,
         signal: controller.signal,
+        onProgress: (info) => {
+          if (!controller.signal.aborted) {
+            const p = Math.round((info.chunkIndex / info.totalChunks) * 80) + 10;
+            setStepperPercent(p);
+            setStepperDetail(info.stage);
+          }
+        },
+        onProgressiveUpdate: (intermediateSyllabus) => {
+          if (!controller.signal.aborted) {
+            setStructuredSyllabus(intermediateSyllabus);
+          }
+        },
       });
 
       if (controller.signal.aborted) return;
 
-      // Automatically proceed to topic-wise YouTube recommendations
       setStructuredSyllabus(structured);
-      setConfirmedSyllabus(structured);
-      setTopicVideoResults({});
-      setPreferencesDirtySinceSearch(false);
       setAnalysisStage('confirmed');
-      void runTopicWiseVideoSearch(structured, preferences);
+
+      // Automatically search first unit's topics
+      if (structured.units.length > 0 && isAppsScriptConfigured()) {
+        setStepperStage('searching');
+        setStepperPercent(95);
+        setStepperDetail('Finding recommended lectures for Unit 1...');
+        await handleSearchUnitTopics(structured.units[0]);
+      }
     } catch (err) {
       if (isAbortError(err) || controller.signal.aborted) {
+        setAnalysisStage('idle');
         return;
       }
-      const message =
-        err instanceof Error
-          ? err.message
-          : 'Failed to analyse syllabus with Gemini. Please try again.';
-      setAnalysisError(message);
+      const userErr = resolveUserError(err);
+      setAnalysisError(userErr);
       setAnalysisStage('error');
     } finally {
-      analysisInFlightRef.current = false;
       if (analysisAbortRef.current === controller) {
         analysisAbortRef.current = null;
       }
     }
   };
 
-  const getCurrentPipelineInput = (): {
-    text: string;
-    sourceFileName?: string;
-    sourceLabel: string;
-  } | null => {
-    if (inputMode === 'upload') {
-      if (!uploadedFile) {
-        setUploadError(
-          'Please upload a PDF, JPG, JPEG, or PNG syllabus file, or switch to "Enter Syllabus Text".'
-        );
-        return null;
+  // Overall watched progress calculation for top bar
+  const overallProgress = useMemo(() => {
+    if (!structuredSyllabus || structuredSyllabus.units.length === 0) return null;
+    let totalTopics = 0;
+    let watchedTopics = 0;
+
+    const identifier = structuredSyllabus.subjectCode || structuredSyllabus.subject || 'default';
+    const sKey = `${APP_CONFIG.STORAGE_KEYS.WATCHED_PREFIX}${identifier.replace(/[^a-z0-9]/gi, '_')}`;
+    let savedWatched = new Set<string>();
+    try {
+      const raw = localStorage.getItem(sKey);
+      if (raw) savedWatched = new Set(JSON.parse(raw));
+    } catch {}
+
+    for (const unit of structuredSyllabus.units) {
+      for (const topic of unit.topics) {
+        totalTopics += 1;
+        const topicState = topicVideoResults[topic.id];
+        const hasWatched = topicState?.videos?.some((v) => savedWatched.has(v.id || v.videoId || v.title));
+        if (hasWatched) watchedTopics += 1;
       }
-      if (extractionStatus === 'extracting') {
-        return null;
-      }
-
-      const trimmedExtracted = extractedText.trim();
-      if (!trimmedExtracted) {
-        setUploadError(
-          'Extracted text is empty. Please correct or type your syllabus topics in the text box above before continuing.'
-        );
-        return null;
-      }
-      if (countMeaningfulChars(trimmedExtracted) < 10) {
-        setUploadError(
-          'Extracted syllabus text is too short or incomplete. Please add more detail before analysing.'
-        );
-        return null;
-      }
-
-      return {
-        text: trimmedExtracted,
-        sourceFileName: uploadedFile.name,
-        sourceLabel: `Extracted Document · ${uploadedFile.name}`,
-      };
     }
 
-    const trimmedManual = manualText.trim();
-    if (!trimmedManual) {
-      setUploadError(
-        'Please enter or paste your syllabus units and topics before analysing.'
-      );
-      return null;
-    }
-    if (countMeaningfulChars(trimmedManual) < 10) {
-      setUploadError(
-        'Syllabus text is too short or incomplete. Please enter at least a subject or topic list.'
-      );
-      return null;
-    }
-
-    return {
-      text: trimmedManual,
-      sourceLabel: 'Manual Syllabus Entry',
-    };
-  };
-
-  const handleContinueToAnalysis = () => {
-    const input = getCurrentPipelineInput();
-    if (!input) return;
-
-    setUploadError(null);
-    void runGeminiAnalysis(input);
-  };
-
-  const handleReanalyse = () => {
-    if (analysisInFlightRef.current) return;
-
-    // Prefer current live editor input if valid, otherwise retry last submitted text
-    const currentInput =
-      inputMode === 'upload' && uploadedFile && extractedText.trim()
-        ? {
-            text: extractedText.trim(),
-            sourceFileName: uploadedFile.name,
-            sourceLabel: `Extracted Document · ${uploadedFile.name}`,
-          }
-        : inputMode === 'manual' && manualText.trim()
-          ? {
-              text: manualText.trim(),
-              sourceLabel: 'Manual Syllabus Entry',
-            }
-          : lastAnalyzedInputRef.current;
-
-    if (!currentInput || countMeaningfulChars(currentInput.text) < 10) {
-      setAnalysisError('Syllabus text is empty or incomplete. Please provide valid syllabus text.');
-      setAnalysisStage('error');
-      return;
-    }
-
-    void runGeminiAnalysis(currentInput);
-  };
-
-  const handlePreferencesChange = (next: SearchPreferences) => {
-    setPreferences(next);
-    if (analysisStage === 'confirmed' && confirmedSyllabus) {
-      setPreferencesDirtySinceSearch(true);
-    }
-  };
-
-  const handleResetPreferences = () => {
-    setPreferences(DEFAULT_PREFERENCES);
-    if (analysisStage === 'confirmed' && confirmedSyllabus) {
-      setPreferencesDirtySinceSearch(true);
-    }
-  };
-
-  const handleConfirmAndContinue = (cleanedSyllabus: StructuredSyllabus) => {
-    setConfirmedSyllabus(cleanedSyllabus);
-    setAnalysisStage('confirmed');
-    void runTopicWiseVideoSearch(cleanedSyllabus, preferences);
-  };
-
-  const handleRefreshAllVideos = () => {
-    if (!confirmedSyllabus) return;
-    void runTopicWiseVideoSearch(confirmedSyllabus, preferences);
-  };
-
-  const handleSearchSingleTopic = (
-    topic: StructuredTopic,
-    prefsOverride?: SearchPreferences
-  ) => {
-    if (!confirmedSyllabus) return;
-    setConfigurationNotice(null);
-    const effectivePrefs = prefsOverride ?? preferences;
-    const sessionId = videoSearchSessionRef.current;
-    const signal =
-      videoSearchAbortRef.current?.signal ?? new AbortController().signal;
-    void fetchVideosForTopic(
-      confirmedSyllabus.subject,
-      topic,
-      effectivePrefs,
-      signal,
-      sessionId
-    );
-  };
-
-  const handleEnableFallbackAndRetryTopic = (topic: StructuredTopic) => {
-    const nextPrefs: SearchPreferences = {
-      ...preferences,
-      allowFallbackChannels: true,
-    };
-    setPreferences(nextPrefs);
-    handleSearchSingleTopic(topic, nextPrefs);
-  };
+    const percent = totalTopics > 0 ? Math.round((watchedTopics / totalTopics) * 100) : 0;
+    return { watched: watchedTopics, total: totalTopics, percent };
+  }, [structuredSyllabus, topicVideoResults, watchedTrigger]);
 
   return (
-    <div id="top" className="min-h-screen flex flex-col bg-white text-[#0B1528]">
-      <Navbar />
-
-      <main className="flex-1">
-        <HeroUploader
-          inputMode={inputMode}
-          onInputModeChange={setInputMode}
-          uploadedFile={uploadedFile}
-          onFileUploadStart={handleFileUploadStart}
-          onClearDocument={handleClearDocument}
-          onCancelExtraction={handleCancelExtraction}
-          extractionStatus={extractionStatus}
-          extractionProgress={extractionProgress}
-          extractionMeta={extractionMeta}
-          extractedText={extractedText}
-          onExtractedTextChange={setExtractedText}
-          manualText={manualText}
-          onManualTextChange={setManualText}
-          uploadError={uploadError}
-          onUploadError={setUploadError}
-          isAnalysing={analysisStage === 'analysing'}
-          onContinueToAnalysis={handleContinueToAnalysis}
+    <ErrorBoundary>
+      <div className="min-h-screen flex flex-col bg-surface-app text-text-main">
+        {/* Top bar with subject name, progress, theme toggle, and print */}
+        <Navbar
+          subjectName={structuredSyllabus?.subject}
+          subjectCode={structuredSyllabus?.subjectCode}
+          overallProgress={overallProgress}
+          onResetSyllabus={handleResetSyllabus}
+          onPrint={() => window.print()}
         />
 
-        <SearchPreferencesPanel
-          preferences={preferences}
-          onChange={handlePreferencesChange}
-          onReset={handleResetPreferences}
-        />
+        {/* Transient Dismissible Banner */}
+        {transientBannerError && (
+          <div className="max-w-4xl mx-auto w-full px-4 sm:px-6 pt-4">
+            <div
+              role="alert"
+              className="flex items-start justify-between gap-3 rounded-md border border-border-strong bg-surface p-3 text-xs"
+            >
+              <div className="space-y-0.5">
+                <span className="font-semibold text-text-main">
+                  {transientBannerError.title}:{' '}
+                </span>
+                <span className="text-text-muted">{transientBannerError.message}</span>
+              </div>
+              <button
+                type="button"
+                onClick={() => setTransientBannerError(null)}
+                aria-label="Dismiss message"
+                className="rounded p-1 text-text-muted hover:text-text-main cursor-pointer"
+              >
+                <X className="h-3.5 w-3.5" strokeWidth={1.75} />
+              </button>
+            </div>
+          </div>
+        )}
 
-        <StructuredSyllabusReview
-          stage={analysisStage}
-          syllabus={structuredSyllabus}
-          confirmedSyllabus={confirmedSyllabus}
-          preferences={preferences}
-          topicVideoResults={topicVideoResults}
-          isSearchingVideos={isSearchingVideos}
-          isYoutubeConfigured={isAppsScriptConfigured()}
-          configurationNotice={configurationNotice}
-          preferencesDirty={preferencesDirtySinceSearch}
-          errorMessage={analysisError}
-          onUpdateSyllabus={setStructuredSyllabus}
-          onReanalyse={handleReanalyse}
-          onConfirmAndContinue={handleConfirmAndContinue}
-          onRefreshAllVideos={handleRefreshAllVideos}
-          onStopVideoSearch={abortActiveVideoSearch}
-          onSearchSingleTopic={(topic) => handleSearchSingleTopic(topic)}
-          onEnableFallbackAndRetryTopic={handleEnableFallbackAndRetryTopic}
-          onRetry={handleReanalyse}
-          onGoToUpload={() => scrollToSection('upload-section')}
-        />
+        <main className="flex-1 max-w-7xl mx-auto w-full px-4 sm:px-6 py-6 space-y-6">
+          {/* VIEW 1: Tool Screen (Upload / Paste Panel) */}
+          {analysisStage === 'idle' && (
+            <div className="space-y-6">
+              <HeroUploader
+                inputMode={inputMode}
+                onInputModeChange={setInputMode}
+                uploadedFile={uploadedFile}
+                onFileUploadStart={handleFileUploadStart}
+                onClearDocument={handleClearDocument}
+                onCancelExtraction={handleCancelActiveProcess}
+                extractionStatus={extractionStatus}
+                extractionProgress={extractionProgress}
+                extractionMeta={extractionMeta}
+                extractedText={extractedText}
+                onExtractedTextChange={setExtractedText}
+                manualText={manualText}
+                onManualTextChange={setManualText}
+                uploadError={uploadError}
+                onUploadError={setUploadError}
+                isProcessing={false}
+                onSubmit={handleStartAnalysis}
+              />
 
-        <HowItWorksSection />
-      </main>
+              <div className="max-w-4xl mx-auto">
+                <SearchPreferencesPanel
+                  preferences={preferences}
+                  onChange={handlePreferencesChange}
+                  onReset={handleResetPreferences}
+                />
+              </div>
+            </div>
+          )}
 
-      <Footer />
-    </div>
+          {/* VIEW 2: Stepper (Loading State) */}
+          {analysisStage === 'analysing' && (
+            <div className="max-w-3xl mx-auto py-8">
+              <Stepper
+                currentStage={stepperStage}
+                progressPercent={stepperPercent}
+                detailMessage={stepperDetail}
+                onCancel={handleCancelActiveProcess}
+              />
+            </div>
+          )}
+
+          {/* VIEW 3: Analysis Error */}
+          {analysisStage === 'error' && analysisError && (
+            <div className="max-w-lg mx-auto py-12 text-center">
+              <div className="rounded-lg border border-error-border bg-surface p-6 space-y-3">
+                <div className="mx-auto flex h-10 w-10 items-center justify-center rounded-md bg-error-bg text-error-text">
+                  <AlertTriangle className="h-5 w-5" strokeWidth={1.75} />
+                </div>
+                <h3 className="text-sm font-semibold text-text-main">
+                  {analysisError.title}
+                </h3>
+                <p className="text-xs text-text-muted leading-relaxed">
+                  {analysisError.message}
+                </p>
+                {analysisError.action && (
+                  <p className="text-xs font-medium text-text-main">
+                    {analysisError.action}
+                  </p>
+                )}
+                <div className="pt-2 flex justify-center gap-2">
+                  <button
+                    type="button"
+                    onClick={handleStartAnalysis}
+                    className="inline-flex items-center gap-1.5 rounded-md bg-accent px-3 py-1.5 text-xs font-semibold text-white hover:bg-accent-hover transition-colors cursor-pointer"
+                  >
+                    <RotateCcw className="h-3 w-3" strokeWidth={1.75} />
+                    <span>Try Again</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setAnalysisStage('idle')}
+                    className="rounded-md border border-border-subtle bg-surface px-3 py-1.5 text-xs font-medium text-text-muted hover:border-border-strong hover:text-text-main transition-colors cursor-pointer"
+                  >
+                    Edit Input
+                  </button>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* VIEW 4: Structured Roadmap View */}
+          {analysisStage === 'confirmed' && structuredSyllabus && (
+            <div className="space-y-6">
+              <TopicVideoRoadmap
+                syllabus={structuredSyllabus}
+                preferences={preferences}
+                topicVideoResults={topicVideoResults}
+                isSearching={isSearchingVideos}
+                isYoutubeConfigured={isAppsScriptConfigured()}
+                configurationNotice={configurationNotice}
+                onSearchSingleTopic={(topic) => {
+                  const controller = new AbortController();
+                  void fetchVideosForTopic(
+                    structuredSyllabus.subject,
+                    topic,
+                    preferences,
+                    controller.signal
+                  );
+                }}
+                onSearchUnitTopics={handleSearchUnitTopics}
+                onRefreshAllVideos={() => {
+                  if (structuredSyllabus.units[0]) {
+                    void handleSearchUnitTopics(structuredSyllabus.units[0]);
+                  }
+                }}
+              />
+            </div>
+          )}
+        </main>
+
+        <Footer />
+      </div>
+    </ErrorBoundary>
   );
 }

@@ -126,30 +126,86 @@ export function reconstructPdfPageText(
 }
 
 /**
+ * Checks whether a line matches common page number or footer patterns.
+ */
+function isPageNumberOrFooterLine(line: string): boolean {
+  const trimmed = line.trim().toLowerCase();
+  if (!trimmed) return true;
+
+  // Patterns like "Page 1", "Page 1 of 12", "1 / 15", "12", "- 4 -", "[ 5 ]"
+  if (/^(?:page\s*)?\d+(?:\s*(?:of|\/|-)\s*\d+)?$/i.test(trimmed)) return true;
+  if (/^[-–—]\s*\d+\s*[-–—]$/.test(trimmed)) return true;
+  if (/^\[\s*\d+\s*\]$/.test(trimmed)) return true;
+
+  // Common footer/disclaimer patterns
+  if (/^(?:copyright|all rights reserved|\(c\)|©)/i.test(trimmed)) return true;
+  if (/^www\.[a-z0-9.-]+\.[a-z]{2,}/i.test(trimmed)) return true;
+  if (/^https?:\/\//i.test(trimmed)) return true;
+
+  return false;
+}
+
+/**
  * Normalizes extracted text from PDF.js or Tesseract OCR while preserving
  * unit numbers, module headings, and bulleted/numbered topic lists.
+ * Also strips repeated headers/footers/page numbers and duplicate consecutive lines.
  */
 export function normalizeSyllabusText(rawText: string): string {
   if (!rawText) return '';
 
-  const lines = rawText
+  const rawLines = rawText
     .replace(/\r\n/g, '\n')
     .replace(/\r/g, '\n')
     .replace(/\u00A0/g, ' ')
-    .split('\n')
-    .map((line) => {
-      // Collapse internal multiple spaces, keep leading bullet normalization clean
-      const trimmed = line.replace(/[ \t]+/g, ' ').trim();
-      if (!trimmed) return '';
-      // Normalize bullet glyphs into standard '- '
-      return trimmed.replace(/^[•▪◦●■◆➢➤]\s*/, '- ');
-    });
+    .split('\n');
 
-  // Collapse 3+ consecutive empty lines into max 1 blank line
+  // Track line frequencies to detect repeated headers across multiple pages
+  const lineFrequencies = new Map<string, number>();
+  for (const raw of rawLines) {
+    const t = raw.trim();
+    if (t.length > 5 && t.length < 90 && !/^(?:unit|module|chapter|part)\b/i.test(t)) {
+      lineFrequencies.set(t, (lineFrequencies.get(t) || 0) + 1);
+    }
+  }
+
+  const cleanedLines: string[] = [];
+  let lastNonEmpty = '';
+
+  for (const line of rawLines) {
+    const trimmed = line.replace(/[ \t]+/g, ' ').trim();
+    if (!trimmed) {
+      if (cleanedLines.length > 0 && cleanedLines[cleanedLines.length - 1] !== '') {
+        cleanedLines.push('');
+      }
+      continue;
+    }
+
+    // Filter page numbers and footers
+    if (isPageNumberOrFooterLine(trimmed)) {
+      continue;
+    }
+
+    // Filter repetitive header lines that appear 3+ times (e.g. university header repeated on each page)
+    const freq = lineFrequencies.get(trimmed) || 0;
+    if (freq >= 3 && !/^(?:unit|module|chapter|part)\b/i.test(trimmed)) {
+      continue;
+    }
+
+    // Filter consecutive duplicate lines
+    if (trimmed.toLowerCase() === lastNonEmpty.toLowerCase()) {
+      continue;
+    }
+
+    // Normalize bullet glyphs
+    const normalizedBullet = trimmed.replace(/^[•▪◦●■◆➢➤]\s*/, '- ');
+    cleanedLines.push(normalizedBullet);
+    lastNonEmpty = trimmed;
+  }
+
+  // Remove trailing blank lines and collapse multiple blanks
   const collapsed: string[] = [];
   let blankStreak = 0;
-
-  for (const line of lines) {
+  for (const line of cleanedLines) {
     if (line === '') {
       blankStreak += 1;
       if (blankStreak <= 1 && collapsed.length > 0) {

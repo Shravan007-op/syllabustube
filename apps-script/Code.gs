@@ -271,6 +271,15 @@ function parsePostPayload_(e) {
     throw createAppError_('INVALID_PAYLOAD', 'Request payload must be a JSON object.');
   }
 
+  // Shared secret validation (if configured in Script Properties)
+  const expectedSecret = PropertiesService.getScriptProperties().getProperty('PROXY_SECRET');
+  if (expectedSecret && expectedSecret.trim()) {
+    const providedSecret = parsed._proxySecret || (e.parameter && e.parameter.proxySecret);
+    if (!providedSecret || String(providedSecret).trim() !== expectedSecret.trim()) {
+      throw createAppError_('UNAUTHORIZED', 'Invalid or missing proxy secret.');
+    }
+  }
+
   return parsed;
 }
 

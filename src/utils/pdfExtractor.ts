@@ -1,6 +1,7 @@
 import { GlobalWorkerOptions, getDocument } from 'pdfjs-dist';
 import pdfjsWorkerUrl from 'pdfjs-dist/build/pdf.worker.min.mjs?url';
 import { createWorker, OEM, type Worker as TesseractWorker } from 'tesseract.js';
+import { APP_CONFIG } from '../config';
 import type { ExtractionProgress, ExtractionResult } from '../types/syllabus';
 import {
   countMeaningfulChars,
@@ -44,12 +45,12 @@ export async function extractPdfDocument(
   const { signal, onProgress, onRegisterCancelCleanup } = options;
 
   throwIfAborted(signal);
-  onProgress?.({ percent: 5, stage: 'Validating PDF file...' });
+  onProgress?.({ percent: 5, stage: 'Reading file...' });
 
   const isPdfHeaderValid = await hasPdfMagicHeader(file);
   if (!isPdfHeaderValid) {
     throw new Error(
-      'This file does not appear to be a valid PDF document. Please check the file or upload a valid PDF, JPG, or PNG.'
+      'This file does not appear to be a valid PDF document. Please upload a valid PDF, JPG, or PNG file.'
     );
   }
 
@@ -73,7 +74,7 @@ export async function extractPdfDocument(
       try {
         await workerToClose.terminate();
       } catch {
-        // Ignore cleanup errors so original extraction errors are preserved
+        // Ignore cleanup errors
       }
     }
   };
@@ -88,14 +89,14 @@ export async function extractPdfDocument(
       try {
         await pdfDoc.cleanup();
       } catch {
-        // Ignore document cleanup errors
+        // Ignore
       }
     }
 
     try {
       await loadingTask.destroy();
     } catch {
-      // Ignore loading task destruction errors
+      // Ignore
     }
   };
 
@@ -113,16 +114,24 @@ export async function extractPdfDocument(
       const msg = err instanceof Error ? err.message.toLowerCase() : '';
       if (msg.includes('password')) {
         throw new Error(
-          'This PDF is password-protected. Please unlock it or export an unprotected copy before uploading.'
+          'This PDF is password-protected. Please unlock it before uploading.'
         );
       }
       throw new Error(
-        'Unable to read this PDF file. It may be corrupted or use an unsupported PDF structure.'
+        'Unable to read this PDF file. It may be corrupted or use an unsupported structure.'
       );
     }
+
     const totalPages = pdfDoc.numPages;
     if (totalPages === 0) {
       throw new Error('This PDF contains zero pages.');
+    }
+
+    // Check maximum page limit
+    if (totalPages > APP_CONFIG.MAX_PDF_PAGES) {
+      throw new Error(
+        `This PDF contains ${totalPages} pages, which exceeds the ${APP_CONFIG.MAX_PDF_PAGES} page limit. Please extract and upload only the relevant syllabus pages (usually 2-10 pages).`
+      );
     }
 
     const pageEntries: Array<{
@@ -135,9 +144,10 @@ export async function extractPdfDocument(
     for (let pageNum = 1; pageNum <= totalPages; pageNum++) {
       throwIfAborted(signal);
 
+      const percent = Math.round(10 + (pageNum / totalPages) * 35);
       onProgress?.({
-        percent: Math.round(10 + (pageNum / totalPages) * 30),
-        stage: `Inspecting PDF page ${pageNum} of ${totalPages}...`,
+        percent,
+        stage: `Extracting text (page ${pageNum} of ${totalPages})`,
         currentPage: pageNum,
         totalPages,
       });
@@ -160,15 +170,13 @@ export async function extractPdfDocument(
     const ocrQueue = pageEntries.filter((p) => p.needsOcr);
     const textPagesCount = pageEntries.length - ocrQueue.length;
 
-    // Pass 2: Run local Tesseract OCR on scanned pages while preserving original page order
+    // Pass 2: Run local Tesseract OCR on scanned pages in a Web Worker
     if (ocrQueue.length > 0) {
       throwIfAborted(signal);
 
       onProgress?.({
-        percent: 42,
-        stage: `Detected ${ocrQueue.length} scanned ${
-          ocrQueue.length === 1 ? 'page' : 'pages'
-        }. Initialising local OCR engine...`,
+        percent: 45,
+        stage: `Starting OCR engine for ${ocrQueue.length} scanned page(s)...`,
         currentPage: 1,
         totalPages: ocrQueue.length,
       });
@@ -180,11 +188,12 @@ export async function extractPdfDocument(
           if (signal?.aborted) return;
           if (msg.status === 'recognizing text') {
             const perPageProgress = (currentOcrIndex + msg.progress) / ocrQueue.length;
-            const percent = Math.min(97, Math.round(45 + perPageProgress * 52));
+            const percent = Math.min(97, Math.round(45 + perPageProgress * 50));
+            const currentPage = ocrQueue[currentOcrIndex]?.pageNum ?? 1;
             onProgress?.({
               percent,
-              stage: `Running OCR on scanned page ${ocrQueue[currentOcrIndex]?.pageNum ?? 1} of ${totalPages}...`,
-              currentPage: ocrQueue[currentOcrIndex]?.pageNum,
+              stage: `Extracting text (page ${currentPage} of ${totalPages} - OCR)`,
+              currentPage,
               totalPages,
             });
           }
@@ -197,15 +206,15 @@ export async function extractPdfDocument(
         const entry = ocrQueue[i];
 
         onProgress?.({
-          percent: Math.round(45 + (i / ocrQueue.length) * 52),
-          stage: `Rendering scanned page ${entry.pageNum} of ${totalPages} for OCR...`,
+          percent: Math.round(45 + (i / ocrQueue.length) * 50),
+          stage: `Extracting text (page ${entry.pageNum} of ${totalPages} - OCR)`,
           currentPage: entry.pageNum,
           totalPages,
         });
 
         const page = await pdfDoc.getPage(entry.pageNum);
         const baseViewport = page.getViewport({ scale: 1 });
-        const targetScale = Math.min(2.2, Math.max(1.5, 1600 / Math.max(baseViewport.width, 1)));
+        const targetScale = Math.min(2.0, Math.max(1.4, 1500 / Math.max(baseViewport.width, 1)));
         const viewport = page.getViewport({ scale: targetScale });
 
         const canvas = document.createElement('canvas');
@@ -217,7 +226,6 @@ export async function extractPdfDocument(
           throw new Error('Browser canvas rendering context is unavailable for PDF OCR.');
         }
 
-        // Fill crisp white background before rendering PDF page
         ctx.fillStyle = '#ffffff';
         ctx.fillRect(0, 0, canvas.width, canvas.height);
 
@@ -232,12 +240,10 @@ export async function extractPdfDocument(
         const ocrResult = await activeTesseractWorker.recognize(canvas);
         const ocrText = ocrResult.data?.text ?? '';
 
-        // Combine with any partial embedded text if OCR found richer content
         if (countMeaningfulChars(ocrText) >= countMeaningfulChars(entry.text)) {
           entry.text = ocrText;
         }
 
-        // Release canvas memory immediately
         canvas.width = 0;
         canvas.height = 0;
         page.cleanup();
@@ -249,7 +255,7 @@ export async function extractPdfDocument(
 
     onProgress?.({
       percent: 98,
-      stage: 'Organising extracted unit and topic structure...',
+      stage: 'Cleaning and organizing extracted text...',
       totalPages,
     });
 
@@ -269,7 +275,7 @@ export async function extractPdfDocument(
           ? 'pdf-ocr'
           : 'pdf-hybrid';
 
-    onProgress?.({ percent: 100, stage: 'Extraction complete', totalPages });
+    onProgress?.({ percent: 100, stage: 'Text extraction complete', totalPages });
 
     return {
       text: normalized,

@@ -1,5 +1,4 @@
 import {
-  analyseSyllabusWithAppsScript,
   isAppsScriptConfigured,
 } from '../services/geminiService.js';
 import type {
@@ -8,6 +7,7 @@ import type {
   StructuredUnit,
   VerificationFlag,
 } from '../types/syllabus';
+import { processChunksProgressively, splitTextIntoChunks } from './chunking';
 
 let idCounter = 0;
 
@@ -29,9 +29,8 @@ export function validateAndHydrateStructuredSyllabus(
 
   const data = raw as Record<string, unknown>;
 
-  if (typeof data.subject !== 'string' || typeof data.subjectCode !== 'string') {
-    throw new Error('Syllabus JSON is missing valid "subject" or "subjectCode" fields.');
-  }
+  const subject = typeof data.subject === 'string' ? data.subject.trim() : '';
+  const subjectCode = typeof data.subjectCode === 'string' ? data.subjectCode.trim() : '';
 
   if (!Array.isArray(data.units) || data.units.length === 0) {
     throw new Error('Syllabus JSON does not contain any units or topics.');
@@ -106,8 +105,8 @@ export function validateAndHydrateStructuredSyllabus(
     : [];
 
   return {
-    subject: data.subject.trim(),
-    subjectCode: data.subjectCode.trim(),
+    subject,
+    subjectCode,
     units,
     verificationFlags,
     isIncomplete: Boolean(data.isIncomplete),
@@ -121,19 +120,22 @@ export async function analyzeSyllabusViaApi(
     sourceFileName?: string;
     sourceLabel: string;
     signal?: AbortSignal;
+    onProgress?: (info: { chunkIndex: number; totalChunks: number; stage: string }) => void;
+    onProgressiveUpdate?: (mergedSyllabus: StructuredSyllabus) => void;
   }
 ): Promise<StructuredSyllabus> {
-  if (isAppsScriptConfigured()) {
-    const payload = await analyseSyllabusWithAppsScript(text, {
-      sourceFileName: options.sourceFileName,
-      signal: options.signal,
-    });
-    return validateAndHydrateStructuredSyllabus(payload, options.sourceLabel);
+  if (!isAppsScriptConfigured()) {
+    throw new Error('Apps Script URL is not configured. Please check VITE_APPS_SCRIPT_URL.');
   }
 
-  // Production: Apps Script must be configured; otherwise throw.
-  if (!isAppsScriptConfigured()) {
-    throw new Error('Apps Script URL not configured (VITE_APPS_SCRIPT_URL). Cannot analyze syllabus.');
-  }
-  // This line is unreachable because the Apps Script branch above already returns.
+  const chunks = splitTextIntoChunks(text);
+
+  return processChunksProgressively({
+    chunks,
+    sourceFileName: options.sourceFileName,
+    sourceLabel: options.sourceLabel,
+    signal: options.signal,
+    onProgress: options.onProgress,
+    onProgressiveUpdate: options.onProgressiveUpdate,
+  });
 }

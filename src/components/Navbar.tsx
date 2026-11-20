@@ -1,106 +1,156 @@
-import { useState } from 'react';
-import { Menu, X } from 'lucide-react';
+import { useEffect, useState } from 'react';
+import { Moon, Printer, RotateCcw, Sun } from 'lucide-react';
+import { APP_CONFIG } from '../config';
 
-export function Navbar() {
-  const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
+interface NavbarProps {
+  subjectName?: string;
+  subjectCode?: string;
+  overallProgress?: {
+    watched: number;
+    total: number;
+    percent: number;
+  } | null;
+  onResetSyllabus?: () => void;
+  onPrint?: () => void;
+}
 
-  const handleLinkClick = () => {
-    setMobileMenuOpen(false);
+export function Navbar({
+  subjectName,
+  subjectCode,
+  overallProgress,
+  onResetSyllabus,
+  onPrint,
+}: NavbarProps) {
+  const [isDark, setIsDark] = useState<boolean>(() => {
+    if (typeof window === 'undefined') return false;
+    return document.documentElement.classList.contains('dark');
+  });
+
+  useEffect(() => {
+    const observer = new MutationObserver(() => {
+      setIsDark(document.documentElement.classList.contains('dark'));
+    });
+    observer.observe(document.documentElement, {
+      attributes: true,
+      attributeFilter: ['class'],
+    });
+    return () => observer.disconnect();
+  }, []);
+
+  const toggleTheme = () => {
+    const nextDark = !isDark;
+    setIsDark(nextDark);
+    if (nextDark) {
+      document.documentElement.classList.add('dark');
+      localStorage.setItem(APP_CONFIG.STORAGE_KEYS.THEME, 'dark');
+    } else {
+      document.documentElement.classList.remove('dark');
+      localStorage.setItem(APP_CONFIG.STORAGE_KEYS.THEME, 'light');
+    }
+  };
+
+  const handlePrint = () => {
+    if (onPrint) {
+      onPrint();
+    } else {
+      window.print();
+    }
   };
 
   return (
-    <header className="sticky top-0 z-40 border-b border-slate-200 bg-white/95 backdrop-blur-sm">
-      <div className="mx-auto flex h-16 max-w-7xl items-center justify-between gap-8 px-4 sm:px-6 lg:px-8">
-        {/* Brand Wordmark */}
-        <a
-          href="#top"
-          className="flex items-center gap-2.5 text-lg font-bold tracking-tight text-[#0B1528] whitespace-nowrap shrink-0 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#0F1E3D] focus-visible:ring-offset-2 rounded-md"
-        >
-          <span
-            aria-hidden="true"
-            className="inline-flex h-8 w-8 items-center justify-center rounded-lg bg-[#0F1E3D] text-white"
+    <header className="sticky top-0 z-40 border-b border-border-subtle bg-surface/95 backdrop-blur-xs">
+      <div className="mx-auto flex h-14 max-w-7xl items-center justify-between gap-4 px-4 sm:px-6">
+        {/* Brand */}
+        <div className="flex items-center gap-3 shrink-0">
+          <a
+            href="/"
+            onClick={(e) => {
+              if (onResetSyllabus && (subjectName || subjectCode)) {
+                e.preventDefault();
+                onResetSyllabus();
+              }
+            }}
+            className="flex items-center gap-2 text-sm font-semibold tracking-tight text-text-main hover:text-accent transition-colors cursor-pointer"
           >
-            <svg
-              viewBox="0 0 24 24"
-              fill="none"
-              className="h-4 w-4"
-              stroke="currentColor"
-              strokeWidth="2.2"
-              strokeLinecap="round"
-              strokeLinejoin="round"
+            <span
+              aria-hidden="true"
+              className="inline-flex h-7 w-7 items-center justify-center rounded-md bg-accent text-white font-mono text-xs font-bold"
             >
-              <path d="M4 19.5v-15A2.5 2.5 0 0 1 6.5 2H20v20H6.5a2.5 2.5 0 0 1 0-5H20" />
-              <polygon points="10,8 15,11 10,14" fill="currentColor" stroke="none" />
-            </svg>
-          </span>
-          <span>SyllabusTube</span>
-        </a>
+              ST
+            </span>
+            <span className="font-sans">SyllabusTube</span>
+          </a>
 
-        {/* Primary Navigation Links */}
-        <nav
-          aria-label="Primary Navigation"
-          className="hidden md:flex items-center gap-8 text-sm font-medium text-slate-600"
-        >
-          <a
-            href="#upload-section"
-            className="whitespace-nowrap shrink-0 py-1 hover:text-[#0B1528] hover:underline underline-offset-4 transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#0F1E3D] rounded"
-          >
-            Upload Syllabus
-          </a>
-          <a
-            href="#preferences-section"
-            className="whitespace-nowrap shrink-0 py-1 hover:text-[#0B1528] hover:underline underline-offset-4 transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#0F1E3D] rounded"
-          >
-            Preferences
-          </a>
-          <a
-            href="#how-it-works"
-            className="whitespace-nowrap shrink-0 py-1 hover:text-[#0B1528] hover:underline underline-offset-4 transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#0F1E3D] rounded"
-          >
-            How It Works
-          </a>
-        </nav>
+          {(subjectName || subjectCode) && (
+            <div className="hidden sm:flex items-center gap-1.5 pl-3 border-l border-border-subtle text-xs text-text-muted">
+              {subjectCode && (
+                <span className="font-mono font-medium text-text-main">{subjectCode}</span>
+              )}
+              {subjectCode && subjectName && <span>·</span>}
+              {subjectName && <span className="truncate max-w-[220px]">{subjectName}</span>}
+            </div>
+          )}
+        </div>
 
-        {/* Mobile Drawer Trigger */}
-        <div className="flex items-center md:hidden shrink-0">
+        {/* Center: Overall Progress if available */}
+        {overallProgress && overallProgress.total > 0 && (
+          <div className="hidden md:flex items-center gap-3 flex-1 max-w-xs mx-auto">
+            <div className="h-1.5 flex-1 overflow-hidden rounded-full bg-surface-muted border border-border-subtle">
+              <div
+                className="h-full bg-accent transition-all duration-300"
+                style={{ width: `${overallProgress.percent}%` }}
+              />
+            </div>
+            <span className="font-mono text-xs text-text-muted whitespace-nowrap tabular-nums">
+              {overallProgress.watched}/{overallProgress.total} watched ({overallProgress.percent}%)
+            </span>
+          </div>
+        )}
+
+        {/* Right actions */}
+        <div className="flex items-center gap-2">
+          {onPrint && (subjectName || subjectCode) && (
+            <button
+              type="button"
+              onClick={handlePrint}
+              aria-label="Export or print syllabus roadmap"
+              title="Print / Export Roadmap"
+              className="inline-flex h-8 items-center gap-1.5 rounded-md border border-border-subtle bg-surface px-2.5 text-xs font-medium text-text-muted hover:border-border-strong hover:text-text-main transition-colors cursor-pointer"
+            >
+              <Printer className="h-3.5 w-3.5" strokeWidth={1.75} />
+              <span className="hidden sm:inline">Print</span>
+            </button>
+          )}
+
+          {onResetSyllabus && (subjectName || subjectCode) && (
+            <button
+              type="button"
+              onClick={onResetSyllabus}
+              aria-label="Start with a new syllabus"
+              title="New Syllabus"
+              className="inline-flex h-8 items-center gap-1.5 rounded-md border border-border-subtle bg-surface px-2.5 text-xs font-medium text-text-muted hover:border-border-strong hover:text-text-main transition-colors cursor-pointer"
+            >
+              <RotateCcw className="h-3.5 w-3.5" strokeWidth={1.75} />
+              <span className="hidden sm:inline">New Syllabus</span>
+            </button>
+          )}
+
+          {/* Theme Toggle Button */}
           <button
             type="button"
-            onClick={() => setMobileMenuOpen((prev) => !prev)}
-            aria-label={mobileMenuOpen ? 'Close navigation menu' : 'Open navigation menu'}
-            aria-expanded={mobileMenuOpen}
-            className="inline-flex h-10 w-10 items-center justify-center rounded-lg border border-slate-200 text-[#0B1528] hover:bg-slate-50 transition-colors cursor-pointer"
+            onClick={toggleTheme}
+            aria-label={isDark ? 'Switch to light mode' : 'Switch to dark mode'}
+            title={isDark ? 'Switch to light mode' : 'Switch to dark mode'}
+            className="inline-flex h-8 w-8 items-center justify-center rounded-md border border-border-subtle bg-surface text-text-muted hover:border-border-strong hover:text-text-main transition-colors cursor-pointer"
           >
-            {mobileMenuOpen ? <X className="h-5 w-5" /> : <Menu className="h-5 w-5" />}
+            {isDark ? (
+              <Sun className="h-4 w-4 text-amber-400" strokeWidth={1.75} />
+            ) : (
+              <Moon className="h-4 w-4 text-slate-700" strokeWidth={1.75} />
+            )}
           </button>
         </div>
       </div>
-
-      {/* Mobile Dropdown Drawer */}
-      {mobileMenuOpen && (
-        <div className="md:hidden border-t border-slate-200 bg-white px-4 py-4 space-y-2">
-          <a
-            href="#upload-section"
-            onClick={handleLinkClick}
-            className="block rounded-lg px-3 py-2.5 text-sm font-medium text-slate-700 hover:bg-slate-50 hover:text-[#0B1528]"
-          >
-            Upload Syllabus
-          </a>
-          <a
-            href="#preferences-section"
-            onClick={handleLinkClick}
-            className="block rounded-lg px-3 py-2.5 text-sm font-medium text-slate-700 hover:bg-slate-50 hover:text-[#0B1528]"
-          >
-            Preferences
-          </a>
-          <a
-            href="#how-it-works"
-            onClick={handleLinkClick}
-            className="block rounded-lg px-3 py-2.5 text-sm font-medium text-slate-700 hover:bg-slate-50 hover:text-[#0B1528]"
-          >
-            How It Works
-          </a>
-        </div>
-      )}
     </header>
   );
 }
