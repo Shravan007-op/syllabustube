@@ -29,6 +29,7 @@ export type AppErrorCode =
   | 'TIMEOUT'
   | 'ABORTED'
   | 'AUTH_REQUIRED'
+  | 'UNAUTHORIZED'
   | 'UNKNOWN';
 
 export interface UserFriendlyError {
@@ -104,6 +105,11 @@ export const ERROR_MAPPINGS: Record<AppErrorCode, Omit<UserFriendlyError, 'code'
     message: 'The backend returned an authentication redirect.',
     action: 'If signed into multiple Google accounts, test in an Incognito window, or ensure the script is deployed to Anyone.',
   },
+  UNAUTHORIZED: {
+    title: 'Proxy Secret Mismatch',
+    message: 'The backend rejected the request because PROXY_SECRET is set in Apps Script Script Properties but does not match your website environment.',
+    action: 'Delete PROXY_SECRET from your Apps Script Script Properties, or set the matching PROXY_SECRET in your Vercel Environment Variables.',
+  },
   UNKNOWN: {
     title: 'Unexpected Error',
     message: 'An unexpected problem occurred while processing your request.',
@@ -153,6 +159,9 @@ export function resolveUserError(error: unknown): UserFriendlyError {
   }
   if (lower.includes('accounts.google.com') || lower.includes('authentication redirect') || lower.includes('html_response')) {
     return { code: 'AUTH_REQUIRED', ...ERROR_MAPPINGS.AUTH_REQUIRED };
+  }
+  if (lower.includes('unauthorized') || lower.includes('proxy secret')) {
+    return { code: 'UNAUTHORIZED', ...ERROR_MAPPINGS.UNAUTHORIZED };
   }
   if (lower.includes('network') || lower.includes('cors') || lower.includes('failed to fetch')) {
     return { code: 'NETWORK', ...ERROR_MAPPINGS.NETWORK };
