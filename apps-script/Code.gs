@@ -22,8 +22,8 @@
 
 const APP_CONFIG = {
   SERVICE_NAME: 'SyllabusTube Apps Script Backend',
-  DEFAULT_GEMINI_MODEL: 'gemini-2.0-flash-lite',
-  DEFAULT_GEMINI_FALLBACK_MODEL: 'gemini-2.0-flash',
+  DEFAULT_GEMINI_MODEL: 'gemini-1.5-flash',
+  DEFAULT_GEMINI_FALLBACK_MODEL: 'gemini-1.5-flash-8b',
   MAX_CHARS_PER_CALL: 25000,
   DEFAULT_YOUTUBE_DAILY_BUDGET: 10000,
   YOUTUBE_BUDGET_CUTOFF_RATIO: 0.90, // Cut off search.list at 90% (9,000 units)
@@ -607,11 +607,6 @@ function handleAnalyseSyllabus_(payload) {
   let geminiCallsUsed = 0;
 
   try {
-    const primaryModel =
-      getOptionalScriptProperty_('GEMINI_MODEL') || APP_CONFIG.DEFAULT_GEMINI_MODEL;
-    const fallbackModel =
-      getOptionalScriptProperty_('GEMINI_FALLBACK_MODEL') ||
-      APP_CONFIG.DEFAULT_GEMINI_FALLBACK_MODEL;
     const maxCharsPerCall =
       Number(getOptionalScriptProperty_('MAX_CHARS_PER_CALL')) ||
       APP_CONFIG.MAX_CHARS_PER_CALL;
@@ -623,23 +618,11 @@ function handleAnalyseSyllabus_(payload) {
       try {
         geminiCallsUsed++;
         const requestBody = buildGeminiSyllabusRequestBody_(input.syllabusText, input.sourceFileName);
-        const apiResponse = callGeminiWithBackoffAndFailover_(primaryModel, requestBody);
+        const apiResponse = callGeminiWithAutoModelFallback_(requestBody);
         const rawJsonText = extractGeminiTextOutput_(apiResponse);
         structured = parseAndValidateSyllabusJson_(rawJsonText);
-      } catch (primaryErr) {
-        // Fallback model if first model output fails JSON validation or schema
-        if (fallbackModel && fallbackModel !== primaryModel) {
-          console.warn('Primary model failed validation, trying fallback model ' + fallbackModel);
-          try {
-            geminiCallsUsed++;
-            const fallbackBody = buildGeminiSyllabusRequestBody_(input.syllabusText, input.sourceFileName);
-            const fallbackResponse = callGeminiWithBackoffAndFailover_(fallbackModel, fallbackBody);
-            const rawFallbackText = extractGeminiTextOutput_(fallbackResponse);
-            structured = parseAndValidateSyllabusJson_(rawFallbackText);
-          } catch (fallbackErr) {
-            console.warn('Fallback model failed, attempting section splitting: ' + fallbackErr.message);
-          }
-        }
+      } catch (singleErr) {
+        console.warn('Single-call structuring failed, falling back to unit splitting: ' + singleErr.message);
       }
     }
 
@@ -648,8 +631,6 @@ function handleAnalyseSyllabus_(payload) {
       structured = structureBySectionsAndMerge_(
         input.syllabusText,
         input.sourceFileName,
-        primaryModel,
-        fallbackModel,
         function () {
           geminiCallsUsed++;
         }
@@ -671,6 +652,59 @@ function handleAnalyseSyllabus_(payload) {
   } finally {
     releaseSubmissionGuard_(guard, completedSuccessfully);
   }
+}
+
+function getCandidateGeminiModels_() {
+  const customModel = getOptionalScriptProperty_('GEMINI_MODEL');
+  const customFallback = getOptionalScriptProperty_('GEMINI_FALLBACK_MODEL');
+
+  const pool = [
+    customModel,
+    customFallback,
+    APP_CONFIG.DEFAULT_GEMINI_MODEL,
+    'gemini-1.5-flash',
+    'gemini-1.5-flash-latest',
+    'gemini-2.5-flash',
+    'gemini-2.5-flash-lite',
+    'gemini-1.5-flash-8b',
+  ];
+
+  const unique = [];
+  for (let i = 0; i < pool.length; i++) {
+    const m = typeof pool[i] === 'string' ? pool[i].trim() : '';
+    // Skip deprecated models known to fail
+    if (m && m !== 'gemini-2.0-flash' && unique.indexOf(m) === -1) {
+      unique.push(m);
+    }
+  }
+  return unique.length > 0 ? unique : ['gemini-1.5-flash'];
+}
+
+function callGeminiWithAutoModelFallback_(requestBody) {
+  const models = getCandidateGeminiModels_();
+  let lastError = null;
+
+  for (let i = 0; i < models.length; i++) {
+    const model = models[i];
+    try {
+      return callGeminiWithBackoffAndFailover_(model, requestBody);
+    } catch (err) {
+      lastError = err;
+      const errMsg = String((err && err.message) || '').toLowerCase();
+      const isModelDeprecation =
+        errMsg.indexOf('no longer available') !== -1 ||
+        errMsg.indexOf('not found') !== -1 ||
+        errMsg.indexOf('unsupported') !== -1 ||
+        (err && err.code === 'GEMINI_MODEL_NOT_FOUND');
+
+      if (isModelDeprecation && i < models.length - 1) {
+        console.warn('Gemini model "' + model + '" unavailable (' + err.message + '). Trying next model "' + models[i + 1] + '"...');
+        continue;
+      }
+      throw err;
+    }
+  }
+  throw lastError;
 }
 
 function buildGeminiSyllabusRequestBody_(syllabusText, sourceFileName) {
@@ -713,7 +747,7 @@ function buildGeminiSyllabusRequestBody_(syllabusText, sourceFileName) {
  * Splits large syllabus into logical unit sections, structures each separately,
  * and merges the units in sequence.
  */
-function structureBySectionsAndMerge_(syllabusText, sourceFileName, primaryModel, fallbackModel, onCall) {
+function structureBySectionsAndMerge_(syllabusText, sourceFileName, onCall) {
   const sections = splitSyllabusIntoUnitSections_(syllabusText);
   let mergedSubject = '';
   let mergedCode = '';
@@ -724,21 +758,9 @@ function structureBySectionsAndMerge_(syllabusText, sourceFileName, primaryModel
     const secText = sections[i];
     if (onCall) onCall();
 
-    let structuredSec = null;
-    try {
-      const body = buildGeminiSyllabusRequestBody_(secText, sourceFileName);
-      const res = callGeminiWithBackoffAndFailover_(primaryModel, body);
-      structuredSec = parseAndValidateSyllabusJson_(extractGeminiTextOutput_(res));
-    } catch (e1) {
-      if (fallbackModel && fallbackModel !== primaryModel) {
-        if (onCall) onCall();
-        const fbBody = buildGeminiSyllabusRequestBody_(secText, sourceFileName);
-        const fbRes = callGeminiWithBackoffAndFailover_(fallbackModel, fbBody);
-        structuredSec = parseAndValidateSyllabusJson_(extractGeminiTextOutput_(fbRes));
-      } else {
-        throw e1;
-      }
-    }
+    const body = buildGeminiSyllabusRequestBody_(secText, sourceFileName);
+    const res = callGeminiWithAutoModelFallback_(body);
+    const structuredSec = parseAndValidateSyllabusJson_(extractGeminiTextOutput_(res));
 
     if (structuredSec) {
       if (!mergedSubject && structuredSec.subject) mergedSubject = structuredSec.subject;
@@ -1127,7 +1149,7 @@ function mapUnitTopicsToVideosWithGemini_(subject, unitTitle, topics, candidateV
   };
 
   try {
-    const apiResponse = callGeminiWithBackoffAndFailover_(model, requestBody);
+    const apiResponse = callGeminiWithAutoModelFallback_(requestBody);
     const rawText = extractGeminiTextOutput_(apiResponse);
     const parsed = JSON.parse(rawText);
     const mapping = {};
