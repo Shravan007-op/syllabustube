@@ -577,6 +577,7 @@ function validateAnalyseSyllabusPayload_(payload) {
 }
 
 function handleAnalyseSyllabus_(payload) {
+  const startTime = Date.now();
   const input = validateAnalyseSyllabusPayload_(payload);
   const textHash = computeSha256_(input.syllabusText);
 
@@ -622,18 +623,19 @@ function handleAnalyseSyllabus_(payload) {
         const rawJsonText = extractGeminiTextOutput_(apiResponse);
         structured = parseAndValidateSyllabusJson_(rawJsonText);
       } catch (singleErr) {
-        console.warn('Single-call structuring failed, falling back to unit splitting: ' + singleErr.message);
+        console.warn('Single-call structuring failed or took too long, falling back to unit splitting: ' + (singleErr ? singleErr.message : ''));
       }
     }
 
-    // 4. Fallback to section/unit splitting if text is large or single-call failed
+    // 4. Fallback to section/unit splitting if text is large or single-call failed/timed out
     if (!structured) {
       structured = structureBySectionsAndMerge_(
         input.syllabusText,
         input.sourceFileName,
         function () {
           geminiCallsUsed++;
-        }
+        },
+        startTime
       );
     }
 
@@ -749,7 +751,8 @@ function buildGeminiSyllabusRequestBody_(syllabusText, sourceFileName) {
  * Splits large syllabus into logical unit sections, structures each separately,
  * and merges the units in sequence.
  */
-function structureBySectionsAndMerge_(syllabusText, sourceFileName, onCall) {
+function structureBySectionsAndMerge_(syllabusText, sourceFileName, onCall, startTime) {
+  const opStartTime = startTime || Date.now();
   const sections = splitSyllabusIntoUnitSections_(syllabusText);
   let mergedSubject = '';
   let mergedCode = '';
@@ -757,6 +760,29 @@ function structureBySectionsAndMerge_(syllabusText, sourceFileName, onCall) {
   const mergedFlags = [];
 
   for (let i = 0; i < sections.length; i++) {
+    // Apps Script timeout safeguard: if execution time exceeds 45s, prevent unhandled timeout
+    if (Date.now() - opStartTime > 45000) {
+      console.warn('Execution time approaching deadline in structureBySectionsAndMerge_ (' + (Date.now() - opStartTime) + 'ms)');
+      if (mergedUnits.length > 0) {
+        mergedFlags.push({
+          location: 'Overall',
+          issue: 'Processing was stopped due to time limit; partial syllabus returned.',
+        });
+        return {
+          subject: mergedSubject,
+          subjectCode: mergedCode,
+          isIncomplete: true,
+          verificationFlags: mergedFlags,
+          units: mergedUnits,
+        };
+      } else {
+        throw createAppError_(
+          'TIMEOUT',
+          'Syllabus analysis timed out while processing units. Try submitting a smaller section or individual unit.'
+        );
+      }
+    }
+
     const secText = sections[i];
     if (onCall) onCall();
 
@@ -778,6 +804,10 @@ function structureBySectionsAndMerge_(syllabusText, sourceFileName, onCall) {
         }
       }
     }
+  }
+
+  if (mergedUnits.length === 0) {
+    throw createAppError_('AI_FAILED', 'Could not extract syllabus units from the provided text.');
   }
 
   return {
@@ -826,14 +856,42 @@ function callGeminiWithBackoffAndFailover_(model, requestBody) {
   try {
     return callGeminiWithRetry_(model, primaryApiKey, requestBody);
   } catch (primaryErr) {
+    const isRateLimit =
+      primaryErr &&
+      (primaryErr.code === 'RATE_LIMITED' ||
+        primaryErr.code === 'QUOTA_EXCEEDED' ||
+        /rate.?limit|quota|too many requests|429|resource_exhausted/i.test(
+          primaryErr.message || ''
+        ));
+
     if (
       backupApiKey &&
       backupApiKey !== primaryApiKey &&
       backupApiKey !== 'MY_GEMINI_API_KEY_BACKUP'
     ) {
-      console.warn('Primary Gemini key failed, failing over to GEMINI_API_KEY_BACKUP...');
-      return callGeminiWithRetry_(model, backupApiKey, requestBody);
+      console.warn('Primary Gemini key failed (' + (primaryErr && primaryErr.code) + '), failing over to GEMINI_API_KEY_BACKUP...');
+      try {
+        return callGeminiWithRetry_(model, backupApiKey, requestBody);
+      } catch (backupErr) {
+        console.error('Backup Gemini key also failed: ' + ((backupErr && backupErr.message) || ''));
+        const backupIsRateLimit =
+          backupErr &&
+          (backupErr.code === 'RATE_LIMITED' ||
+            backupErr.code === 'QUOTA_EXCEEDED' ||
+            /rate.?limit|quota|too many requests|429|resource_exhausted/i.test(
+              backupErr.message || ''
+            ));
+        if (isRateLimit || backupIsRateLimit) {
+          throw createAppError_('RATE_LIMITED', 'Rate limit exceeded on all configured Gemini API keys.');
+        }
+        throw backupErr;
+      }
     }
+
+    if (isRateLimit) {
+      throw createAppError_('RATE_LIMITED', 'Gemini API rate limit exceeded.');
+    }
+
     throw primaryErr;
   }
 }
@@ -873,7 +931,7 @@ function callGeminiWithRetry_(model, apiKey, requestBody) {
         Utilities.sleep(delay);
         continue;
       }
-      throw createAppError_('GEMINI_NETWORK_ERROR', lastErrorMessage);
+      throw createAppError_('NETWORK', lastErrorMessage);
     }
 
     const upstreamStatus = response.getResponseCode();
@@ -884,7 +942,7 @@ function callGeminiWithRetry_(model, apiKey, requestBody) {
         return JSON.parse(responseBodyText);
       } catch (jsonErr) {
         throw createAppError_(
-          'GEMINI_INVALID_RESPONSE',
+          'AI_FAILED',
           'Gemini API returned a malformed response payload.'
         );
       }
@@ -908,7 +966,7 @@ function callGeminiWithRetry_(model, apiKey, requestBody) {
 
   if (lastUpstreamStatus === 429) {
     throw createAppError_(
-      'QUOTA_EXCEEDED',
+      'RATE_LIMITED',
       'Gemini API quota or rate limit exceeded. Please wait a few seconds and retry.'
     );
   }
@@ -917,7 +975,7 @@ function callGeminiWithRetry_(model, apiKey, requestBody) {
     lastUpstreamStatus === 404 ||
     /not found|is not found|unsupported|no longer available/i.test(lastErrorMessage)
   ) {
-    throw createAppError_('GEMINI_MODEL_NOT_FOUND', lastErrorMessage);
+    throw createAppError_('AI_FAILED', lastErrorMessage);
   }
 
   if (
@@ -926,19 +984,19 @@ function callGeminiWithRetry_(model, apiKey, requestBody) {
     (lastUpstreamStatus === 400 && /api.?key/i.test(lastErrorMessage))
   ) {
     throw createAppError_(
-      'GEMINI_AUTH_ERROR',
+      'AI_FAILED',
       'Gemini API authentication failed. Verify GEMINI_API_KEY in Apps Script Script Properties.'
     );
   }
 
   if (lastUpstreamStatus >= 500) {
     throw createAppError_(
-      'GEMINI_UNAVAILABLE',
+      'AI_FAILED',
       'Gemini API is temporarily unavailable. Please retry in a few moments.'
     );
   }
 
-  throw createAppError_('GEMINI_ERROR', lastErrorMessage);
+  throw createAppError_('AI_FAILED', lastErrorMessage);
 }
 
 function extractGeminiTextOutput_(apiResponse) {
@@ -2289,27 +2347,126 @@ function jsonOutput_(payload) {
   );
 }
 
+function normalizeCanonicalErrorCode_(rawCode, rawMessage) {
+  const codeStr = String(rawCode || '').toUpperCase();
+  const msgStr = String(rawMessage || '').toLowerCase();
+
+  // 1. Rate limiting & Throttling
+  if (
+    codeStr === 'RATE_LIMITED' ||
+    codeStr === 'TOO_MANY_REQUESTS' ||
+    codeStr === 'THROTTLED' ||
+    msgStr.indexOf('rate limit') !== -1 ||
+    msgStr.indexOf('throttl') !== -1 ||
+    msgStr.indexOf('too many requests') !== -1 ||
+    msgStr.indexOf('429') !== -1
+  ) {
+    return 'RATE_LIMITED';
+  }
+
+  // 2. Quota exhaustion
+  if (
+    codeStr === 'QUOTA_EXCEEDED' ||
+    codeStr === 'DAILY_QUOTA_EXCEEDED' ||
+    codeStr === 'YOUTUBE_QUOTA_EXCEEDED' ||
+    msgStr.indexOf('quota') !== -1 ||
+    msgStr.indexOf('daily limit') !== -1 ||
+    msgStr.indexOf('resource_exhausted') !== -1
+  ) {
+    return 'QUOTA_EXCEEDED';
+  }
+
+  // 3. Timeouts
+  if (
+    codeStr === 'TIMEOUT' ||
+    codeStr === 'TIMED_OUT' ||
+    codeStr === 'GATEWAY_TIMEOUT' ||
+    codeStr === 'DEADLINE_EXCEEDED' ||
+    msgStr.indexOf('timeout') !== -1 ||
+    msgStr.indexOf('timed out') !== -1 ||
+    msgStr.indexOf('deadline') !== -1
+  ) {
+    return 'TIMEOUT';
+  }
+
+  // 4. Network failures
+  if (
+    codeStr === 'NETWORK' ||
+    codeStr === 'NETWORK_ERROR' ||
+    codeStr === 'GEMINI_NETWORK_ERROR' ||
+    codeStr === 'YOUTUBE_NETWORK_ERROR' ||
+    codeStr === 'FETCH_ERROR' ||
+    msgStr.indexOf('network') !== -1 ||
+    msgStr.indexOf('fetch') !== -1 ||
+    msgStr.indexOf('dns') !== -1 ||
+    msgStr.indexOf('connection') !== -1
+  ) {
+    return 'NETWORK';
+  }
+
+  // 5. AI structuring failures
+  if (
+    codeStr === 'AI_FAILED' ||
+    codeStr === 'INVALID_SCHEMA' ||
+    codeStr === 'GEMINI_INVALID_RESPONSE' ||
+    codeStr === 'GEMINI_ERROR' ||
+    codeStr === 'GEMINI_UNAVAILABLE' ||
+    codeStr === 'GEMINI_MODEL_NOT_FOUND' ||
+    codeStr === 'GEMINI_AUTH_ERROR' ||
+    codeStr === 'PARSE_FAILED' ||
+    codeStr === 'EMPTY_SYLLABUS' ||
+    codeStr === 'INVALID_JSON' ||
+    msgStr.indexOf('gemini') !== -1 ||
+    msgStr.indexOf('structur') !== -1 ||
+    msgStr.indexOf('parse') !== -1 ||
+    msgStr.indexOf('model') !== -1
+  ) {
+    return 'AI_FAILED';
+  }
+
+  return 'UNKNOWN';
+}
+
+function getSafeUserMessageForCode_(code) {
+  switch (code) {
+    case 'RATE_LIMITED':
+      return 'Requests were sent too quickly and were temporarily throttled.';
+    case 'QUOTA_EXCEEDED':
+      return 'The daily API quota has been reached.';
+    case 'AI_FAILED':
+      return 'The AI was unable to structure this syllabus content.';
+    case 'TIMEOUT':
+      return 'The request took too long to complete.';
+    case 'NETWORK':
+      return 'A network communication error occurred.';
+    case 'UNKNOWN':
+    default:
+      return 'An unexpected problem occurred while processing your request.';
+  }
+}
+
 function errorOutput_(err) {
   const isAppError = Boolean(err && err.isAppError);
-  const code = isAppError && err.code ? err.code : 'INTERNAL_ERROR';
-  const rawMessage =
-    isAppError && err.message
-      ? err.message
-      : 'An unexpected error occurred in the SyllabusTube Apps Script backend.';
+  const rawCode = isAppError && err.code ? err.code : 'UNKNOWN';
+  const rawMessage = err && err.message ? String(err.message) : '';
 
-  const safeMessage = sanitizeErrorMessage_(
+  const canonicalCode = normalizeCanonicalErrorCode_(rawCode, rawMessage);
+  const safeMessage = getSafeUserMessageForCode_(canonicalCode);
+
+  const sanitizedDetail = sanitizeErrorMessage_(
     sanitizeErrorMessage_(rawMessage, getOptionalScriptProperty_('GEMINI_API_KEY')),
     getOptionalScriptProperty_('YOUTUBE_API_KEY')
   );
 
-  if (!isAppError) {
-    console.error('Unhandled Apps Script error:', err);
-  }
+  // Log real error server-side only in Apps Script
+  console.error('[SyllabusTube Server Error]', canonicalCode, sanitizedDetail || '(no detail)');
 
   return jsonOutput_({
     ok: false,
+    code: canonicalCode,
+    message: safeMessage,
     error: {
-      code: code,
+      code: canonicalCode,
       message: safeMessage,
     },
   });

@@ -153,9 +153,9 @@ export async function postToBackend(requestBody, options = {}) {
 
   throw new AppsScriptServiceError(
     lastError instanceof Error && lastError.message
-      ? `Unable to connect to backend: ${lastError.message}. If you have multiple Google accounts logged into this browser or an ad-blocker enabled, please try in an Incognito / Private window.`
-      : 'Unable to read response from the Google Apps Script backend. If you are logged into multiple Google accounts or using an ad-blocker, please test in an Incognito / Private window.',
-    'NETWORK_OR_CORS_ERROR'
+      ? `Unable to connect to backend: ${lastError.message}`
+      : 'Unable to connect to the backend server.',
+    'NETWORK'
   );
 }
 
@@ -190,24 +190,26 @@ export async function analyseSyllabusWithAppsScript(syllabusText, options = {}) 
   const { response, payload } = await postToBackend(requestBody, options);
 
   if (!response.ok) {
+    const errCode =
+      (typeof payload?.code === 'string' && payload.code.trim()) ||
+      (typeof payload?.error?.code === 'string' && payload.error.code.trim()) ||
+      (response.status === 429 ? 'RATE_LIMITED' : response.status >= 500 ? 'NETWORK' : 'UNKNOWN');
     const errMsg =
-      payload && payload.error && typeof payload.error.message === 'string'
-        ? payload.error.message
-        : `Backend request failed with HTTP status ${response.status}.`;
-    throw new AppsScriptServiceError(errMsg, 'HTTP_ERROR');
+      (typeof payload?.message === 'string' && payload.message.trim()) ||
+      (typeof payload?.error?.message === 'string' && payload.error.message.trim()) ||
+      `Backend request failed with HTTP status ${response.status}.`;
+    throw new AppsScriptServiceError(errMsg, errCode);
   }
 
   if (!payload || typeof payload !== 'object' || payload.ok !== true) {
-    const errObj =
-      payload && payload.error && typeof payload.error === 'object' ? payload.error : {};
-    const errMsg =
-      typeof errObj.message === 'string' && errObj.message.trim()
-        ? errObj.message.trim()
-        : 'Apps Script backend reported an analysis failure.';
     const errCode =
-      typeof errObj.code === 'string' && errObj.code.trim()
-        ? errObj.code.trim()
-        : 'BACKEND_ERROR';
+      (typeof payload?.code === 'string' && payload.code.trim()) ||
+      (typeof payload?.error?.code === 'string' && payload.error.code.trim()) ||
+      'UNKNOWN';
+    const errMsg =
+      (typeof payload?.message === 'string' && payload.message.trim()) ||
+      (typeof payload?.error?.message === 'string' && payload.error.message.trim()) ||
+      'Apps Script backend reported an analysis failure.';
     throw new AppsScriptServiceError(errMsg, errCode);
   }
 
@@ -220,7 +222,7 @@ export async function analyseSyllabusWithAppsScript(syllabusText, options = {}) 
   ) {
     throw new AppsScriptServiceError(
       'Apps Script backend response is missing required syllabus fields (subject, subjectCode, units).',
-      'INVALID_SCHEMA'
+      'AI_FAILED'
     );
   }
 

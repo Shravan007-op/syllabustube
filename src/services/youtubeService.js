@@ -61,24 +61,26 @@ export async function searchTopicVideosWithAppsScript(params, options = {}) {
   const { response, payload } = await postToBackend(requestBody, options);
 
   if (!response.ok) {
+    const errCode =
+      (typeof payload?.code === 'string' && payload.code.trim()) ||
+      (typeof payload?.error?.code === 'string' && payload.error.code.trim()) ||
+      (response.status === 429 ? 'RATE_LIMITED' : response.status >= 500 ? 'NETWORK' : 'UNKNOWN');
     const errMsg =
-      payload && payload.error && typeof payload.error.message === 'string'
-        ? payload.error.message
-        : `Backend YouTube search failed with HTTP status ${response.status}.`;
-    throw new AppsScriptServiceError(errMsg, 'HTTP_ERROR');
+      (typeof payload?.message === 'string' && payload.message.trim()) ||
+      (typeof payload?.error?.message === 'string' && payload.error.message.trim()) ||
+      `Backend YouTube search failed with HTTP status ${response.status}.`;
+    throw new AppsScriptServiceError(errMsg, errCode);
   }
 
   if (!payload || typeof payload !== 'object' || payload.ok !== true) {
-    const errObj =
-      payload && payload.error && typeof payload.error === 'object' ? payload.error : {};
-    const errMsg =
-      typeof errObj.message === 'string' && errObj.message.trim()
-        ? errObj.message.trim()
-        : 'YouTube video search failed.';
     const errCode =
-      typeof errObj.code === 'string' && errObj.code.trim()
-        ? errObj.code.trim()
-        : 'YOUTUBE_ERROR';
+      (typeof payload?.code === 'string' && payload.code.trim()) ||
+      (typeof payload?.error?.code === 'string' && payload.error.code.trim()) ||
+      'UNKNOWN';
+    const errMsg =
+      (typeof payload?.message === 'string' && payload.message.trim()) ||
+      (typeof payload?.error?.message === 'string' && payload.error.message.trim()) ||
+      'YouTube video search failed.';
     throw new AppsScriptServiceError(errMsg, errCode);
   }
 

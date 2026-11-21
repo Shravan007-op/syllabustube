@@ -71,29 +71,29 @@ export const ERROR_MAPPINGS: Record<AppErrorCode, Omit<UserFriendlyError, 'code'
     action: 'Try uploading a higher-contrast scan or enter your syllabus topics manually.',
   },
   NETWORK: {
-    title: 'Connection Issue',
-    message: 'Could not connect to the backend service. This can happen with browser privacy shields or network interruption.',
-    action: 'Check your internet connection, test in an Incognito window, or retry in a moment.',
+    title: 'Connection Failed',
+    message: 'Could not connect to the backend server.',
+    action: 'Check your connection and try again in a few minutes.',
   },
   RATE_LIMITED: {
     title: 'Too Many Requests',
-    message: 'Requests were sent too quickly and were temporarily throttled.',
-    action: 'Please wait a few seconds before trying again.',
+    message: 'Requests were sent too quickly or the daily cap has been reached.',
+    action: 'Try again in a few minutes.',
   },
   AI_FAILED: {
-    title: 'Structuring Failed',
+    title: 'AI Structuring Failed',
     message: 'The AI model could not structure this text into units and topics.',
-    action: 'Ensure the text contains recognizable unit/topic headings and retry.',
+    action: 'Try a smaller file or paste plain unit headings.',
   },
   QUOTA_EXCEEDED: {
-    title: 'Quota Exceeded',
+    title: 'Daily Quota Reached',
     message: 'The daily search or AI API quota has been reached.',
-    action: 'Please try again later or contact the administrator to provide custom API keys.',
+    action: 'Daily limit reached, try tomorrow.',
   },
   TIMEOUT: {
     title: 'Request Timed Out',
-    message: 'The request took too long to complete.',
-    action: 'Try analyzing a smaller syllabus chunk or paste fewer units at a time.',
+    message: 'The operation took too long to complete.',
+    action: 'Try a smaller file or paste fewer units at a time.',
   },
   ABORTED: {
     title: 'Operation Cancelled',
@@ -148,14 +148,24 @@ export function resolveUserError(error: unknown): UserFriendlyError {
   if (lower.includes('empty text') || lower.includes('no readable text') || lower.includes('too short')) {
     return { code: 'EMPTY_TEXT', ...ERROR_MAPPINGS.EMPTY_TEXT };
   }
-  if (lower.includes('quota') || lower.includes('resource_exhausted') || lower.includes('429')) {
+  if (lower.includes('quota') || lower.includes('resource_exhausted')) {
     return { code: 'QUOTA_EXCEEDED', ...ERROR_MAPPINGS.QUOTA_EXCEEDED };
   }
-  if (lower.includes('rate') || lower.includes('throttle') || lower.includes('busy')) {
+  if (lower.includes('rate') || lower.includes('throttle') || lower.includes('busy') || lower.includes('429')) {
     return { code: 'RATE_LIMITED', ...ERROR_MAPPINGS.RATE_LIMITED };
   }
-  if (lower.includes('timeout') || lower.includes('timed out')) {
+  if (lower.includes('timeout') || lower.includes('timed out') || lower.includes('deadline')) {
     return { code: 'TIMEOUT', ...ERROR_MAPPINGS.TIMEOUT };
+  }
+  if (
+    lower.includes('ai') ||
+    lower.includes('gemini') ||
+    lower.includes('structur') ||
+    lower.includes('parse') ||
+    lower.includes('schema') ||
+    lower.includes('candidate')
+  ) {
+    return { code: 'AI_FAILED', ...ERROR_MAPPINGS.AI_FAILED };
   }
   if (lower.includes('accounts.google.com') || lower.includes('authentication redirect') || lower.includes('html_response')) {
     return { code: 'AUTH_REQUIRED', ...ERROR_MAPPINGS.AUTH_REQUIRED };
@@ -163,7 +173,13 @@ export function resolveUserError(error: unknown): UserFriendlyError {
   if (lower.includes('unauthorized') || lower.includes('proxy secret')) {
     return { code: 'UNAUTHORIZED', ...ERROR_MAPPINGS.UNAUTHORIZED };
   }
-  if (lower.includes('network') || lower.includes('cors') || lower.includes('failed to fetch')) {
+  if (
+    lower.includes('network') ||
+    lower.includes('cors') ||
+    lower.includes('failed to fetch') ||
+    lower.includes('connect') ||
+    lower.includes('offline')
+  ) {
     return { code: 'NETWORK', ...ERROR_MAPPINGS.NETWORK };
   }
   if (lower.includes('ocr') || lower.includes('tesseract')) {
@@ -172,8 +188,6 @@ export function resolveUserError(error: unknown): UserFriendlyError {
 
   return {
     code: 'UNKNOWN',
-    title: 'Processing Issue',
-    message: rawMessage.length < 200 ? rawMessage : ERROR_MAPPINGS.UNKNOWN.message,
-    action: ERROR_MAPPINGS.UNKNOWN.action,
+    ...ERROR_MAPPINGS.UNKNOWN,
   };
 }

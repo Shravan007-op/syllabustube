@@ -77,6 +77,8 @@ export default async function handler(req, res) {
   if (req.method !== 'POST') {
     return res.status(405).json({
       ok: false,
+      code: 'METHOD_NOT_ALLOWED',
+      message: 'Only POST requests are supported.',
       error: {
         code: 'METHOD_NOT_ALLOWED',
         message: 'Only POST requests are supported.',
@@ -87,8 +89,11 @@ export default async function handler(req, res) {
   // 1. Sliding window burst rate limit (per minute)
   const clientIp = getClientIp(req);
   if (!checkBurstRateLimit(clientIp)) {
+    console.error(`[Proxy Error] RATE_LIMITED: Burst limit exceeded for IP ${clientIp}`);
     return res.status(429).json({
       ok: false,
+      code: 'RATE_LIMITED',
+      message: 'Too many requests. Please slow down and try again shortly.',
       error: {
         code: 'RATE_LIMITED',
         message: 'Too many requests. Please slow down and try again shortly.',
@@ -104,8 +109,11 @@ export default async function handler(req, res) {
     let payload = {};
     if (typeof req.body === 'string') {
       if (req.body.length > MAX_BODY_SIZE_BYTES) {
+        console.error(`[Proxy Error] FILE_TOO_LARGE from IP ${clientIp}`);
         return res.status(413).json({
           ok: false,
+          code: 'FILE_TOO_LARGE',
+          message: 'Request payload exceeds maximum allowed size of 2 MB.',
           error: {
             code: 'FILE_TOO_LARGE',
             message: 'Request payload exceeds maximum allowed size of 2 MB.',
@@ -115,10 +123,13 @@ export default async function handler(req, res) {
       try {
         payload = JSON.parse(req.body);
       } catch {
+        console.error(`[Proxy Error] INVALID_JSON from IP ${clientIp}`);
         return res.status(400).json({
           ok: false,
+          code: 'AI_FAILED',
+          message: 'Request payload must be valid JSON.',
           error: {
-            code: 'INVALID_JSON',
+            code: 'AI_FAILED',
             message: 'Request payload must be valid JSON.',
           },
         });
@@ -131,10 +142,13 @@ export default async function handler(req, res) {
 
     // Input validation
     if (!payload || typeof payload !== 'object' || typeof payload.action !== 'string') {
+      console.error(`[Proxy Error] INVALID_PAYLOAD from IP ${clientIp}`);
       return res.status(400).json({
         ok: false,
+        code: 'UNKNOWN',
+        message: 'Request payload must be an object with an "action" field.',
         error: {
-          code: 'INVALID_PAYLOAD',
+          code: 'UNKNOWN',
           message: 'Request payload must be an object with an "action" field.',
         },
       });
@@ -177,16 +191,27 @@ export default async function handler(req, res) {
     } catch (e) {}
 
     // Check if backend returned RATE_LIMITED due to onlyIfCached or daily cap
-    if (parsed && !parsed.ok && parsed.error && parsed.error.code === 'RATE_LIMITED') {
+    const backendCode = parsed?.code || parsed?.error?.code;
+    if (parsed && !parsed.ok && backendCode === 'RATE_LIMITED') {
       const resetTime = getUtcMidnightIso();
+      console.error(`[Proxy Error] RATE_LIMITED: Daily cap reached for IP ${clientIp}`);
       return res.status(429).json({
         ok: false,
+        code: 'RATE_LIMITED',
+        message: `Daily syllabus analysis limit reached. Resets at ${resetTime}.`,
+        resetTime,
         error: {
           code: 'RATE_LIMITED',
           message: `Daily syllabus analysis limit reached. Resets at ${resetTime}.`,
           resetTime,
         },
       });
+    }
+
+    if (parsed && !parsed.ok) {
+      const errCode = parsed.code || parsed.error?.code || 'UNKNOWN';
+      const errMsg = parsed.message || parsed.error?.message || 'Upstream backend error';
+      console.error(`[Proxy Upstream Error] IP: ${clientIp} | Action: ${payload.action} | Code: ${errCode} | Detail: ${errMsg}`);
     }
 
     // Server-side logging of quota telemetry
@@ -207,8 +232,11 @@ export default async function handler(req, res) {
     res.setHeader('Content-Type', 'application/json');
     return res.status(200).send(rawData);
   } catch (err) {
+    console.error(`[Proxy Network Error] IP: ${clientIp} | Detail: ${err?.message || 'Failed to connect'}`);
     return res.status(502).json({
       ok: false,
+      code: 'NETWORK',
+      message: 'Could not connect to the backend service. Please check your connection and retry.',
       error: {
         code: 'NETWORK',
         message: 'Could not connect to the backend service. Please check your connection and retry.',

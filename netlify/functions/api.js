@@ -80,11 +80,14 @@ exports.handler = async function (event) {
     'unknown';
 
   if (!checkBurstRateLimit(clientIp)) {
+    console.error(`[Netlify Proxy Error] RATE_LIMITED: Burst limit exceeded for IP ${clientIp}`);
     return {
       statusCode: 429,
       headers: corsHeaders,
       body: JSON.stringify({
         ok: false,
+        code: 'RATE_LIMITED',
+        message: 'Too many requests. Please wait a moment.',
         error: { code: 'RATE_LIMITED', message: 'Too many requests. Please wait a moment.' },
       }),
     };
@@ -97,11 +100,14 @@ exports.handler = async function (event) {
   try {
     const rawBody = event.body || '{}';
     if (rawBody.length > MAX_BODY_SIZE_BYTES) {
+      console.error(`[Netlify Proxy Error] FILE_TOO_LARGE from IP ${clientIp}`);
       return {
         statusCode: 413,
         headers: corsHeaders,
         body: JSON.stringify({
           ok: false,
+          code: 'FILE_TOO_LARGE',
+          message: 'Payload exceeds 2 MB limit.',
           error: { code: 'FILE_TOO_LARGE', message: 'Payload exceeds 2 MB limit.' },
         }),
       };
@@ -111,23 +117,29 @@ exports.handler = async function (event) {
     try {
       payload = JSON.parse(rawBody);
     } catch {
+      console.error(`[Netlify Proxy Error] INVALID_JSON from IP ${clientIp}`);
       return {
         statusCode: 400,
         headers: corsHeaders,
         body: JSON.stringify({
           ok: false,
-          error: { code: 'INVALID_JSON', message: 'Payload must be valid JSON.' },
+          code: 'AI_FAILED',
+          message: 'Payload must be valid JSON.',
+          error: { code: 'AI_FAILED', message: 'Payload must be valid JSON.' },
         }),
       };
     }
 
     if (!payload || typeof payload !== 'object' || typeof payload.action !== 'string') {
+      console.error(`[Netlify Proxy Error] INVALID_PAYLOAD from IP ${clientIp}`);
       return {
         statusCode: 400,
         headers: corsHeaders,
         body: JSON.stringify({
           ok: false,
-          error: { code: 'INVALID_PAYLOAD', message: 'Payload must contain an "action" field.' },
+          code: 'UNKNOWN',
+          message: 'Payload must contain an "action" field.',
+          error: { code: 'UNKNOWN', message: 'Payload must contain an "action" field.' },
         }),
       };
     }
@@ -166,13 +178,18 @@ exports.handler = async function (event) {
       parsed = JSON.parse(data);
     } catch (e) {}
 
-    if (parsed && !parsed.ok && parsed.error && parsed.error.code === 'RATE_LIMITED') {
+    const backendCode = parsed?.code || parsed?.error?.code;
+    if (parsed && !parsed.ok && backendCode === 'RATE_LIMITED') {
       const resetTime = getUtcMidnightIso();
+      console.error(`[Netlify Proxy Error] RATE_LIMITED: Daily cap reached for IP ${clientIp}`);
       return {
         statusCode: 429,
         headers: corsHeaders,
         body: JSON.stringify({
           ok: false,
+          code: 'RATE_LIMITED',
+          message: `Daily syllabus analysis limit reached. Resets at ${resetTime}.`,
+          resetTime,
           error: {
             code: 'RATE_LIMITED',
             message: `Daily syllabus analysis limit reached. Resets at ${resetTime}.`,
@@ -180,6 +197,12 @@ exports.handler = async function (event) {
           },
         }),
       };
+    }
+
+    if (parsed && !parsed.ok) {
+      const errCode = parsed.code || parsed.error?.code || 'UNKNOWN';
+      const errMsg = parsed.message || parsed.error?.message || 'Upstream backend error';
+      console.error(`[Netlify Proxy Upstream Error] IP: ${clientIp} | Action: ${payload.action} | Code: ${errCode} | Detail: ${errMsg}`);
     }
 
     if (parsed && parsed.telemetry) {
@@ -200,11 +223,14 @@ exports.handler = async function (event) {
       body: data,
     };
   } catch (err) {
+    console.error(`[Netlify Proxy Network Error] IP: ${clientIp} | Detail: ${err?.message || 'Failed to connect'}`);
     return {
       statusCode: 502,
       headers: corsHeaders,
       body: JSON.stringify({
         ok: false,
+        code: 'NETWORK',
+        message: 'Could not connect to backend service. Please try again.',
         error: {
           code: 'NETWORK',
           message: 'Could not connect to backend service. Please try again.',
