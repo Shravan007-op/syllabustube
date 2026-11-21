@@ -16,6 +16,7 @@ export { AppsScriptServiceError, getAppsScriptEndpointUrl, isAppsScriptConfigure
  *
  * @param {{
  *   subject?: string,
+ *   unitTitle?: string,
  *   topicName: string,
  *   subtopics?: string[],
  *   preferences: {
@@ -50,6 +51,8 @@ export async function searchTopicVideosWithAppsScript(params, options = {}) {
     action: 'searchTopicVideos',
     subject:
       params && typeof params.subject === 'string' ? params.subject.trim() : '',
+    unitTitle:
+      params && typeof params.unitTitle === 'string' ? params.unitTitle.trim() : '',
     topicName,
     subtopics: Array.isArray(params?.subtopics) ? params.subtopics : [],
     preferences: params?.preferences ?? {},

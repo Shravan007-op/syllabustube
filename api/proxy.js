@@ -1,10 +1,26 @@
-// In-memory rate limiting store for serverless instance lifetime
-const rateLimitMap = new Map();
+// In-memory stores for rate limiting and daily caps within serverless instance lifetime
+const rateLimitMap = new Map(); // Sliding window for burst requests (60/min)
+const dailyGlobalMap = new Map(); // 'YYYY-MM-DD' -> count
+const dailyIpMap = new Map(); // 'YYYY-MM-DD:ip' -> count
+
 const RATE_LIMIT_WINDOW_MS = 60 * 1000; // 1 minute
 const MAX_REQUESTS_PER_WINDOW = 60;
 const MAX_BODY_SIZE_BYTES = 2 * 1024 * 1024; // 2 MB
 
-function checkRateLimit(ip) {
+const DEFAULT_GLOBAL_DAILY_CAP = 10;
+const DEFAULT_IP_DAILY_CAP = 3;
+
+function getTodayUtcKey() {
+  return new Date().toISOString().slice(0, 10);
+}
+
+function getUtcMidnightIso() {
+  const tomorrow = new Date();
+  tomorrow.setUTCHours(24, 0, 0, 0);
+  return tomorrow.toISOString();
+}
+
+function checkBurstRateLimit(ip) {
   const now = Date.now();
   const record = rateLimitMap.get(ip) || [];
   const validTimestamps = record.filter((t) => now - t < RATE_LIMIT_WINDOW_MS);
@@ -68,9 +84,9 @@ export default async function handler(req, res) {
     });
   }
 
-  // Basic IP Rate Limiting
+  // 1. Sliding window burst rate limit (per minute)
   const clientIp = getClientIp(req);
-  if (!checkRateLimit(clientIp)) {
+  if (!checkBurstRateLimit(clientIp)) {
     return res.status(429).json({
       ok: false,
       error: {
@@ -124,10 +140,26 @@ export default async function handler(req, res) {
       });
     }
 
-    // Inject proxy secret if configured
+    // 2. Daily Analysis Cap Checks (for 'analyseSyllabus')
+    const isAnalysisAction = payload.action === 'analyseSyllabus';
+    const todayKey = getTodayUtcKey();
+    const globalCap = parseInt(process.env.DAILY_ANALYSIS_CAP || String(DEFAULT_GLOBAL_DAILY_CAP), 10);
+    const ipCap = DEFAULT_IP_DAILY_CAP;
+
+    const currentGlobal = dailyGlobalMap.get(todayKey) || 0;
+    const ipKey = `${todayKey}:${clientIp}`;
+    const currentIp = dailyIpMap.get(ipKey) || 0;
+
+    // If capped, we instruct backend to serve ONLY if cached
+    if (isAnalysisAction && (currentGlobal >= globalCap || currentIp >= ipCap)) {
+      payload._onlyIfCached = true;
+    }
+
+    // Inject proxy secret and client info
     if (process.env.PROXY_SECRET) {
       payload._proxySecret = process.env.PROXY_SECRET.trim();
     }
+    payload._clientIp = clientIp;
 
     const response = await fetch(scriptUrl, {
       method: 'POST',
@@ -138,9 +170,42 @@ export default async function handler(req, res) {
       redirect: 'follow',
     });
 
-    const data = await response.text();
+    const rawData = await response.text();
+    let parsed = null;
+    try {
+      parsed = JSON.parse(rawData);
+    } catch (e) {}
+
+    // Check if backend returned RATE_LIMITED due to onlyIfCached or daily cap
+    if (parsed && !parsed.ok && parsed.error && parsed.error.code === 'RATE_LIMITED') {
+      const resetTime = getUtcMidnightIso();
+      return res.status(429).json({
+        ok: false,
+        error: {
+          code: 'RATE_LIMITED',
+          message: `Daily syllabus analysis limit reached. Resets at ${resetTime}.`,
+          resetTime,
+        },
+      });
+    }
+
+    // Server-side logging of quota telemetry
+    if (parsed && parsed.telemetry) {
+      console.log(
+        `[SyllabusTube Telemetry] IP: ${clientIp} | Action: ${payload.action} | Gemini calls: ${parsed.telemetry.geminiCallsUsed || 0} | Est. YouTube units: ${parsed.telemetry.estimatedYoutubeUnitsUsed || 0} | Cached: ${Boolean(parsed.telemetry.cached)}`
+      );
+    }
+
+    // If successful analysis and NOT a cache hit, increment daily usage counters
+    const isCacheHit = Boolean(parsed && (parsed.cached === true || parsed.telemetry?.cached === true));
+    if (isAnalysisAction && parsed && parsed.ok && !isCacheHit) {
+      dailyGlobalMap.set(todayKey, currentGlobal + 1);
+      dailyIpMap.set(ipKey, currentIp + 1);
+      console.log(`[SyllabusTube Daily Usage] Global: ${currentGlobal + 1}/${globalCap} | IP (${clientIp}): ${currentIp + 1}/${ipCap}`);
+    }
+
     res.setHeader('Content-Type', 'application/json');
-    return res.status(200).send(data);
+    return res.status(200).send(rawData);
   } catch (err) {
     return res.status(502).json({
       ok: false,

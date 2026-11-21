@@ -1,9 +1,25 @@
 const rateLimitMap = new Map();
+const dailyGlobalMap = new Map();
+const dailyIpMap = new Map();
+
 const RATE_LIMIT_WINDOW_MS = 60 * 1000;
 const MAX_REQUESTS_PER_WINDOW = 60;
 const MAX_BODY_SIZE_BYTES = 2 * 1024 * 1024;
 
-function checkRateLimit(ip) {
+const DEFAULT_GLOBAL_DAILY_CAP = 10;
+const DEFAULT_IP_DAILY_CAP = 3;
+
+function getTodayUtcKey() {
+  return new Date().toISOString().slice(0, 10);
+}
+
+function getUtcMidnightIso() {
+  const tomorrow = new Date();
+  tomorrow.setUTCHours(24, 0, 0, 0);
+  return tomorrow.toISOString();
+}
+
+function checkBurstRateLimit(ip) {
   const now = Date.now();
   const record = rateLimitMap.get(ip) || [];
   const validTimestamps = record.filter((t) => now - t < RATE_LIMIT_WINDOW_MS);
@@ -63,7 +79,7 @@ exports.handler = async function (event) {
     event.headers['client-ip'] ||
     'unknown';
 
-  if (!checkRateLimit(clientIp)) {
+  if (!checkBurstRateLimit(clientIp)) {
     return {
       statusCode: 429,
       headers: corsHeaders,
@@ -116,9 +132,24 @@ exports.handler = async function (event) {
       };
     }
 
+    // Daily analysis cap checks
+    const isAnalysisAction = payload.action === 'analyseSyllabus';
+    const todayKey = getTodayUtcKey();
+    const globalCap = parseInt(process.env.DAILY_ANALYSIS_CAP || String(DEFAULT_GLOBAL_DAILY_CAP), 10);
+    const ipCap = DEFAULT_IP_DAILY_CAP;
+
+    const currentGlobal = dailyGlobalMap.get(todayKey) || 0;
+    const ipKey = `${todayKey}:${clientIp}`;
+    const currentIp = dailyIpMap.get(ipKey) || 0;
+
+    if (isAnalysisAction && (currentGlobal >= globalCap || currentIp >= ipCap)) {
+      payload._onlyIfCached = true;
+    }
+
     if (process.env.PROXY_SECRET) {
       payload._proxySecret = process.env.PROXY_SECRET.trim();
     }
+    payload._clientIp = clientIp;
 
     const response = await fetch(scriptUrl, {
       method: 'POST',
@@ -130,6 +161,38 @@ exports.handler = async function (event) {
     });
 
     const data = await response.text();
+    let parsed = null;
+    try {
+      parsed = JSON.parse(data);
+    } catch (e) {}
+
+    if (parsed && !parsed.ok && parsed.error && parsed.error.code === 'RATE_LIMITED') {
+      const resetTime = getUtcMidnightIso();
+      return {
+        statusCode: 429,
+        headers: corsHeaders,
+        body: JSON.stringify({
+          ok: false,
+          error: {
+            code: 'RATE_LIMITED',
+            message: `Daily syllabus analysis limit reached. Resets at ${resetTime}.`,
+            resetTime,
+          },
+        }),
+      };
+    }
+
+    if (parsed && parsed.telemetry) {
+      console.log(
+        `[SyllabusTube Telemetry] IP: ${clientIp} | Action: ${payload.action} | Gemini calls: ${parsed.telemetry.geminiCallsUsed || 0} | Est. YouTube units: ${parsed.telemetry.estimatedYoutubeUnitsUsed || 0} | Cached: ${Boolean(parsed.telemetry.cached)}`
+      );
+    }
+
+    const isCacheHit = Boolean(parsed && (parsed.cached === true || parsed.telemetry?.cached === true));
+    if (isAnalysisAction && parsed && parsed.ok && !isCacheHit) {
+      dailyGlobalMap.set(todayKey, currentGlobal + 1);
+      dailyIpMap.set(ipKey, currentIp + 1);
+    }
 
     return {
       statusCode: 200,

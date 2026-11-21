@@ -81,15 +81,21 @@ Turn university syllabus documents into unit-by-unit YouTube study roadmaps.
 | `VITE_APPS_SCRIPT_URL` | Deployed Google Apps Script `/exec` URL |
 | `PROXY_SECRET` | Shared authentication secret sent to Apps Script (optional but recommended) |
 | `ALLOWED_ORIGIN` | Allowed CORS origins for reverse proxy requests (optional) |
+| `DAILY_ANALYSIS_CAP` | Global daily cap on uncached syllabus analysis requests (default: `10`) |
 | `VITE_PORT` | Local preview/dev server port |
 
 ### Apps Script Properties (Project Settings > Script Properties)
 | Property Name | Purpose |
 |---|---|
-| `GEMINI_API_KEY` | Primary Google Gemini API key |
+| `GEMINI_API_KEY` | Primary Google Gemini API key (Required) |
 | `GEMINI_API_KEY_BACKUP` | Backup Gemini API key for automatic failover (optional) |
-| `YOUTUBE_API_KEY` | YouTube Data API v3 key |
-| `GEMINI_MODEL` | Custom Gemini model name (default: `gemini-3.5-flash-lite`) |
+| `YOUTUBE_API_KEY` | YouTube Data API v3 key (optional, falls back to `GEMINI_API_KEY`) |
+| `GEMINI_MODEL` | Primary structuring Gemini model (default: `gemini-2.0-flash-lite`) |
+| `GEMINI_FALLBACK_MODEL` | Fallback model if primary output fails JSON validation (default: `gemini-2.0-flash`) |
+| `MAX_CHARS_PER_CALL` | Maximum syllabus characters per single Gemini call (default: `25000`) |
+| `CACHE_SHEET_ID` | Google Sheet ID for 30-day persistent caching (optional, auto-creates if unset) |
+| `YOUTUBE_DAILY_BUDGET` | Daily YouTube API quota units cap (default: `10000`, 90% cutoff) |
+| `TOPIC_MATCH_THRESHOLD` | Minimum fuzzy score to accept candidate video from playlist (default: `0.45`) |
 | `PROXY_SECRET` | Must match `PROXY_SECRET` from proxy env to reject unauthorized callers |
 
 ## Deployment Steps

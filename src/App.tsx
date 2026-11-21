@@ -31,6 +31,8 @@ import { TopicVideoRoadmap } from './components/TopicVideoRoadmap';
 import { Stepper, StepperStageId } from './components/Stepper';
 import { ErrorBoundary } from './components/ErrorBoundary';
 import { Footer } from './components/Footer';
+import { AuthModal } from './components/AuthModal';
+import { useAuth } from './contexts/AuthContext';
 import { AlertTriangle, RotateCcw, X } from 'lucide-react';
 
 const DEFAULT_PREFERENCES: SearchPreferences = {
@@ -89,6 +91,13 @@ export default function App() {
 
   // Watched state to display top bar overall progress
   const [watchedTrigger, setWatchedTrigger] = useState<number>(0);
+
+  const { user } = useAuth();
+  const [isAuthModalOpen, setIsAuthModalOpen] = useState<boolean>(false);
+  const [authModalReason, setAuthModalReason] = useState<{
+    title: string;
+    subtitle: string;
+  } | null>(null);
 
   const extractionAbortRef = useRef<AbortController | null>(null);
   const extractionCleanupRef = useRef<(() => void) | null>(null);
@@ -246,7 +255,8 @@ export default function App() {
     subject: string,
     topic: StructuredTopic,
     prefs: SearchPreferences,
-    signal: AbortSignal
+    signal: AbortSignal,
+    unitTitle?: string
   ) => {
     if (signal.aborted) return;
 
@@ -262,6 +272,7 @@ export default function App() {
       const result = await searchTopicVideosWithAppsScript(
         {
           subject,
+          unitTitle,
           topicName: topic.topicName,
           subtopics: topic.subtopics,
           preferences: prefs,
@@ -317,7 +328,8 @@ export default function App() {
           structuredSyllabus.subject,
           topic,
           preferences,
-          controller.signal
+          controller.signal,
+          unit.unitName
         );
       }
     } finally {
@@ -437,6 +449,10 @@ export default function App() {
           overallProgress={overallProgress}
           onResetSyllabus={handleResetSyllabus}
           onPrint={() => window.print()}
+          onOpenAuth={() => {
+            setAuthModalReason(null);
+            setIsAuthModalOpen(true);
+          }}
         />
 
         {/* Transient Dismissible Banner */}
@@ -561,11 +577,15 @@ export default function App() {
                 configurationNotice={configurationNotice}
                 onSearchSingleTopic={(topic) => {
                   const controller = new AbortController();
+                  const parentUnit = structuredSyllabus.units.find((u) =>
+                    u.topics.some((t) => t.id === topic.id)
+                  );
                   void fetchVideosForTopic(
                     structuredSyllabus.subject,
                     topic,
                     preferences,
-                    controller.signal
+                    controller.signal,
+                    parentUnit?.unitName
                   );
                 }}
                 onSearchUnitTopics={handleSearchUnitTopics}

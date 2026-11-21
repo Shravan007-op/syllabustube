@@ -2,12 +2,17 @@
  * SyllabusTube — Google Apps Script Backend Proxy
  * (Gemini Syllabus Analysis + YouTube Data API v3 Topic Search)
  *
- * Required Script Properties (Project Settings > Script properties):
- *   - GEMINI_API_KEY  : Your Google Gemini API key
- *   - YOUTUBE_API_KEY : Your YouTube Data API v3 key
- *
- * Optional Script Property:
- *   - GEMINI_MODEL    : Override Gemini model name (defaults to "gemini-3.5-flash-lite")
+ * Supported Script Properties (Project Settings > Script properties):
+ *   - GEMINI_API_KEY          : Primary Google Gemini API key (Required)
+ *   - GEMINI_API_KEY_BACKUP   : Failover Gemini API key for 429/quota recovery (Optional)
+ *   - YOUTUBE_API_KEY         : YouTube Data API v3 key (Optional, falls back to GEMINI_API_KEY)
+ *   - GEMINI_MODEL            : Primary Gemini model (Default: "gemini-2.0-flash-lite")
+ *   - GEMINI_FALLBACK_MODEL   : Fallback model if primary JSON validation fails (Default: "gemini-2.0-flash")
+ *   - MAX_CHARS_PER_CALL      : Maximum syllabus characters for single Gemini call (Default: 25000)
+ *   - CACHE_SHEET_ID          : Google Sheet ID for 30-day persistent caching (Optional, auto-creates if unset)
+ *   - YOUTUBE_DAILY_BUDGET    : Daily YouTube API quota units cap (Default: 10000)
+ *   - TOPIC_MATCH_THRESHOLD   : Min fuzzy/keyword match score to accept playlist video (Default: 0.45)
+ *   - PROXY_SECRET            : Shared secret to reject unauthorized non-proxy calls (Optional)
  *
  * Note on Apps Script Web App responses:
  *   ContentService always returns HTTP 200 OK after Google's redirect; therefore
@@ -17,7 +22,13 @@
 
 const APP_CONFIG = {
   SERVICE_NAME: 'SyllabusTube Apps Script Backend',
-  DEFAULT_GEMINI_MODEL: 'gemini-3.5-flash-lite',
+  DEFAULT_GEMINI_MODEL: 'gemini-2.0-flash-lite',
+  DEFAULT_GEMINI_FALLBACK_MODEL: 'gemini-2.0-flash',
+  MAX_CHARS_PER_CALL: 25000,
+  DEFAULT_YOUTUBE_DAILY_BUDGET: 10000,
+  YOUTUBE_BUDGET_CUTOFF_RATIO: 0.90, // Cut off search.list at 90% (9,000 units)
+  DEFAULT_TOPIC_MATCH_THRESHOLD: 0.45,
+  PERSISTENT_CACHE_TTL_DAYS: 30,
   GEMINI_API_BASE: 'https://generativelanguage.googleapis.com/v1beta/models',
   YOUTUBE_API_BASE: 'https://www.googleapis.com/youtube/v3',
   MAX_REQUEST_BODY_CHARS: 100000,
@@ -27,17 +38,14 @@ const APP_CONFIG = {
   MIN_MEANINGFUL_CHARS: 10,
   MAX_RETRY_ATTEMPTS: 3,
   RETRY_BASE_DELAY_MS: 800,
-  LOCK_WAIT_MS: 2000,
+  LOCK_WAIT_MS: 3000,
   DUPLICATE_COOLDOWN_SECONDS: 15,
   INFLIGHT_LOCK_SECONDS: 60,
   RATE_LIMIT_WINDOW_SECONDS: 60,
-  // GLOBAL script-wide rate limit shared across all Web App callers (NOT per-user).
-  // Anonymous Apps Script Web Apps do not reliably expose caller IP addresses or user identities.
   MAX_REQUESTS_PER_MINUTE: 15,
-  // GLOBAL script-wide per-minute burst cap for YouTube topic search requests.
   MAX_YOUTUBE_REQUESTS_PER_MINUTE: 60,
-  YOUTUBE_CACHE_TTL_SECONDS: 21600, // ~6 hours
-  YOUTUBE_CHANNEL_CACHE_TTL_SECONDS: 21600,
+  YOUTUBE_CACHE_TTL_SECONDS: 21600, // 6h in CacheService
+  YOUTUBE_CHANNEL_CACHE_TTL_SECONDS: 86400,
   MAX_PREFERRED_CHANNELS: 5,
   MAX_YOUTUBE_TOPICS_PER_REQUEST: 8,
   MAX_YOUTUBE_TOPIC_CHARS: 200,
@@ -99,53 +107,51 @@ const SYLLABUS_RESPONSE_SCHEMA = {
         properties: {
           location: {
             type: 'STRING',
-            description: 'Unit or section where the uncertainty occurred.',
+            description: 'Unit or topic reference where the uncertainty occurs.',
           },
-          message: {
+          issue: {
             type: 'STRING',
-            description: 'Brief explanation of what the user should verify.',
+            description: 'Concise explanation of the OCR error, cutoff text, or ambiguity.',
           },
         },
-        required: ['location', 'message'],
+        required: ['location', 'issue'],
       },
     },
     units: {
       type: 'ARRAY',
-      description: 'Ordered list of units/chapters in the syllabus.',
+      description: 'List of syllabus units, modules, or chapters in original course order.',
       items: {
         type: 'OBJECT',
         properties: {
           unitNumber: {
             type: 'INTEGER',
-            description: '1-based unit or chapter number in original order.',
+            description: 'Sequential 1-based unit or module number.',
           },
           unitName: {
             type: 'STRING',
-            description: 'Unit or chapter heading, or empty string if missing.',
+            description: 'Title of the unit/module, or empty string if unlabelled.',
           },
           topics: {
             type: 'ARRAY',
-            description: 'Ordered topics belonging to this unit.',
+            description: 'Distinct academic topics contained within this unit.',
             items: {
               type: 'OBJECT',
               properties: {
                 topicName: {
                   type: 'STRING',
-                  description: 'Clean topic title with obvious OCR typos corrected.',
+                  description: 'Concise, clean academic topic title.',
                 },
                 subtopics: {
                   type: 'ARRAY',
-                  description: 'Clearly specified subtopics, or empty array.',
-                  items: {
-                    type: 'STRING',
-                  },
+                  description: 'Optional list of sub-topics or sub-concepts explicitly listed under this topic.',
+                  items: { type: 'STRING' },
                 },
                 needsVerification: {
                   type: 'BOOLEAN',
-                  description: 'True if this topic came from garbled or uncertain OCR text.',
+                  description: 'True if OCR was garbled or text appeared uncertain for this topic.',
                 },
               },
-              required: ['topicName', 'subtopics'],
+              required: ['topicName'],
             },
           },
         },
@@ -156,35 +162,85 @@ const SYLLABUS_RESPONSE_SCHEMA = {
   required: ['subject', 'subjectCode', 'units'],
 };
 
+const COUNTRY_TO_REGION_CODE = {
+  India: 'IN',
+  'United States': 'US',
+  'United Kingdom': 'GB',
+  Canada: 'CA',
+  Australia: 'AU',
+  Germany: 'DE',
+  France: 'FR',
+  Japan: 'JP',
+  Global: '',
+};
+
+const KNOWN_INDIAN_EDUCATOR_PATTERNS = [
+  'nptel',
+  'gate smashers',
+  'neso academy',
+  'abdul bari',
+  'jenny',
+  "jenny's lectures",
+  'knowledge gate',
+  'gautam vartak',
+  'shanu kuttan',
+  'pradeep kshetrapal',
+  'saurabh shukla',
+  'apna college',
+  'codehelp',
+  'edureka',
+  'simplilearn',
+  'freecodecamp',
+  'mit opencourseware',
+  'stanford',
+  'geeksforgeeks',
+  'durgasoft',
+  'telusko',
+  '5 minutes engineering',
+  'all about electronics',
+  'tutorialspoint',
+  'unacademy',
+  'physics wallah',
+  'vedantu',
+  'khan academy',
+  'dr. gajendra purohit',
+  'bhagwan singh vishwakarma',
+  'tikle',
+  'bhanu priya',
+  'sandip gupta',
+  'education 4u',
+  'easy engineering classes',
+  'engineers adda',
+  'pravin srivastava',
+  'kreatryx',
+  'made easy',
+  'ace engineering academy',
+  'rgpv',
+  'aktu',
+  'vtu',
+  'anna university',
+  'jntu',
+  'sppu',
+  'mumbai university',
+  'makaut',
+];
+
 /* ============================================================================
- * HTTP ENTRY POINTS (Web App)
+ * HTTP ENTRY POINTS
  * ========================================================================== */
 
-/**
- * Health check endpoint for verifying deployment availability in a browser.
- */
 function doGet() {
   return jsonOutput_({
     ok: true,
     service: APP_CONFIG.SERVICE_NAME,
-    supportedActions: ['analyseSyllabus', 'searchYouTubeVideos', 'searchTopicVideos'],
+    supportedActions: ['analyseSyllabus', 'searchYouTubeVideos', 'searchTopicVideos', 'searchUnitVideos'],
   });
 }
 
-/**
- * Primary POST entry point.
- * Parses incoming JSON from e.postData.contents and routes supported actions.
- *
- * Expected request body:
- * {
- *   "action": "analyseSyllabus",
- *   "syllabusText": "...",
- *   "sourceFileName": "optional-filename.pdf"
- * }
- */
 function doPost(e) {
   try {
     const requestPayload = parsePostPayload_(e);
+    verifyProxySecret_(requestPayload);
     const action = validateAction_(requestPayload);
     const result = routeAction_(action, requestPayload);
 
@@ -202,14 +258,17 @@ function doPost(e) {
   }
 }
 
-/* ============================================================================
- * MODULAR ACTION ROUTER
- * ========================================================================== */
+function verifyProxySecret_(payload) {
+  const configuredSecret = getOptionalScriptProperty_('PROXY_SECRET');
+  if (!configuredSecret) {
+    return; // Shared secret check is optional if not set
+  }
+  const provided = payload && payload._proxySecret;
+  if (!provided || provided !== configuredSecret) {
+    throw createAppError_('UNAUTHORIZED', 'Invalid or missing proxy secret.');
+  }
+}
 
-/**
- * Dispatches validated requests to the appropriate feature module.
- * Future YouTube search actions can be registered here later.
- */
 function routeAction_(action, payload) {
   switch (action) {
     case 'analyseSyllabus':
@@ -221,78 +280,243 @@ function routeAction_(action, payload) {
     case 'searchTopicVideos':
       return handleSearchTopicVideos_(payload);
 
+    case 'searchUnitVideos':
+      return handleSearchUnitVideos_(payload);
+
     default:
       throw createAppError_(
         'UNSUPPORTED_ACTION',
-        'Unsupported action "' +
-          action +
-          '". Supported actions: analyseSyllabus, searchYouTubeVideos, searchTopicVideos.'
+        'Unsupported action "' + action + '". Supported actions: analyseSyllabus, searchTopicVideos, searchUnitVideos.'
       );
   }
 }
-
-/* ============================================================================
- * REQUEST PARSING & VALIDATION
- * ========================================================================== */
 
 function parsePostPayload_(e) {
   if (!e || !e.postData || typeof e.postData.contents !== 'string') {
     throw createAppError_(
       'MISSING_BODY',
-      'Request body is missing. Expected a JSON payload with "action" and "syllabusText".'
+      'Request body is missing. Expected a JSON payload with "action".'
     );
   }
 
   if (e.postData.contents.length > APP_CONFIG.MAX_REQUEST_BODY_CHARS) {
     throw createAppError_(
       'PAYLOAD_TOO_LARGE',
-      'Request payload exceeds the maximum allowed size (' +
-        APP_CONFIG.MAX_REQUEST_BODY_CHARS +
-        ' characters).'
+      'Request payload exceeds maximum allowed size (' + APP_CONFIG.MAX_REQUEST_BODY_CHARS + ' chars).'
     );
   }
 
-  const rawContents = e.postData.contents.trim();
-  if (!rawContents) {
-    throw createAppError_(
-      'EMPTY_BODY',
-      'Request body is empty. Expected a JSON payload.'
-    );
-  }
-
-  let parsed;
   try {
-    parsed = JSON.parse(rawContents);
-  } catch (parseErr) {
-    throw createAppError_('INVALID_JSON', 'Invalid JSON in request body.');
-  }
-
-  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
-    throw createAppError_('INVALID_PAYLOAD', 'Request payload must be a JSON object.');
-  }
-
-  // Shared secret validation (if configured in Script Properties)
-  const expectedSecret = PropertiesService.getScriptProperties().getProperty('PROXY_SECRET');
-  if (expectedSecret && expectedSecret.trim()) {
-    const providedSecret = parsed._proxySecret || (e.parameter && e.parameter.proxySecret);
-    if (!providedSecret || String(providedSecret).trim() !== expectedSecret.trim()) {
-      throw createAppError_('UNAUTHORIZED', 'Invalid or missing proxy secret.');
+    const parsed = JSON.parse(e.postData.contents);
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      throw new Error('Payload must be a JSON object.');
     }
+    return parsed;
+  } catch (err) {
+    throw createAppError_('INVALID_JSON', 'Malformed JSON payload: ' + (err.message || ''));
   }
-
-  return parsed;
 }
 
 function validateAction_(payload) {
   if (typeof payload.action !== 'string' || !payload.action.trim()) {
-    throw createAppError_(
-      'MISSING_ACTION',
-      'Missing required "action" field in request payload.'
-    );
+    throw createAppError_('MISSING_ACTION', 'Missing or invalid "action" parameter in request payload.');
   }
-
   return payload.action.trim();
 }
+
+/* ============================================================================
+ * PERSISTENT CACHE (Google Sheet L2 + CacheService L1)
+ * 30-Day TTL store. Cache hits require zero upstream API calls.
+ * ========================================================================== */
+
+const PersistentStore_ = {
+  _ssInstance: null,
+
+  getSpreadsheet: function () {
+    if (this._ssInstance) return this._ssInstance;
+
+    const configuredId = getOptionalScriptProperty_('CACHE_SHEET_ID');
+    if (configuredId) {
+      try {
+        this._ssInstance = SpreadsheetApp.openById(configuredId);
+        return this._ssInstance;
+      } catch (e) {
+        console.warn('Could not open CACHE_SHEET_ID: ' + e.message);
+      }
+    }
+
+    const props = PropertiesService.getScriptProperties();
+    const autoId = props.getProperty('_AUTO_CACHE_SHEET_ID');
+    if (autoId) {
+      try {
+        this._ssInstance = SpreadsheetApp.openById(autoId);
+        return this._ssInstance;
+      } catch (e) {}
+    }
+
+    try {
+      const ss = SpreadsheetApp.create('SyllabusTube_Persistent_Cache');
+      props.setProperty('_AUTO_CACHE_SHEET_ID', ss.getId());
+      this._ssInstance = ss;
+      return ss;
+    } catch (err) {
+      console.warn('Failed to auto-create persistent cache spreadsheet: ' + err.message);
+      return null;
+    }
+  },
+
+  getSheet: function (tabName) {
+    const ss = this.getSpreadsheet();
+    if (!ss) return null;
+    let sheet = ss.getSheetByName(tabName);
+    if (!sheet) {
+      sheet = ss.insertSheet(tabName);
+      sheet.appendRow(['cache_key', 'data_json', 'created_at_ms', 'expires_at_ms']);
+    }
+    return sheet;
+  },
+
+  get: function (tabName, key) {
+    // 1. Fast L1 check in CacheService (up to 6 hours)
+    const l1 = getCachedJson_(tabName + ':' + key);
+    if (l1) return l1;
+
+    // 2. Persistent L2 check in Google Sheets
+    try {
+      const sheet = this.getSheet(tabName);
+      if (!sheet) return null;
+
+      const lastRow = sheet.getLastRow();
+      if (lastRow <= 1) return null;
+
+      // Read keys and expiration column
+      const data = sheet.getRange(2, 1, lastRow - 1, 4).getValues();
+      const now = Date.now();
+
+      for (let i = 0; i < data.length; i++) {
+        const rowKey = String(data[i][0] || '');
+        if (rowKey === key) {
+          const expiresAt = Number(data[i][3] || 0);
+          if (expiresAt > now) {
+            const parsed = JSON.parse(String(data[i][1] || '{}'));
+            // Re-populate L1 cache
+            setCachedJson_(tabName + ':' + key, parsed, APP_CONFIG.YOUTUBE_CACHE_TTL_SECONDS);
+            return parsed;
+          }
+          return null; // Expired
+        }
+      }
+    } catch (err) {
+      console.warn('PersistentStore_.get error on tab ' + tabName + ': ' + err.message);
+    }
+    return null;
+  },
+
+  set: function (tabName, key, dataObj, ttlDays) {
+    const days = ttlDays || APP_CONFIG.PERSISTENT_CACHE_TTL_DAYS;
+    const now = Date.now();
+    const expiresAt = now + days * 24 * 60 * 60 * 1000;
+
+    // 1. Write to L1 CacheService
+    setCachedJson_(tabName + ':' + key, dataObj, APP_CONFIG.YOUTUBE_CACHE_TTL_SECONDS);
+
+    // 2. Write to L2 Google Sheets
+    try {
+      const sheet = this.getSheet(tabName);
+      if (!sheet) return;
+
+      const jsonString = JSON.stringify(dataObj);
+      if (jsonString.length > 49000) {
+        // Exceeds single cell character limit in Google Sheets
+        return;
+      }
+
+      const lastRow = sheet.getLastRow();
+      if (lastRow > 1) {
+        const keys = sheet.getRange(2, 1, lastRow - 1, 1).getValues();
+        for (let i = 0; i < keys.length; i++) {
+          if (String(keys[i][0]) === key) {
+            sheet.getRange(i + 2, 2, 1, 3).setValues([[jsonString, now, expiresAt]]);
+            return;
+          }
+        }
+      }
+
+      sheet.appendRow([key, jsonString, now, expiresAt]);
+    } catch (err) {
+      console.warn('PersistentStore_.set error on tab ' + tabName + ': ' + err.message);
+    }
+  },
+};
+
+/* ============================================================================
+ * DAILY YOUTUBE BUDGET COUNTER & CUTOFF
+ * At 90% of YOUTUBE_DAILY_BUDGET (default 10,000), stops search.list calls.
+ * ========================================================================== */
+
+function getTodayUtcDateString_() {
+  return Utilities.formatDate(new Date(), 'UTC', 'yyyy_MM_dd');
+}
+
+function getDailyYouTubeUnitsUsed_() {
+  const dateKey = 'YT_UNITS_' + getTodayUtcDateString_();
+  const raw = PropertiesService.getScriptProperties().getProperty(dateKey);
+  return raw ? parseInt(raw, 10) : 0;
+}
+
+function recordYouTubeUnitCost_(units) {
+  if (units <= 0) return;
+  const dateKey = 'YT_UNITS_' + getTodayUtcDateString_();
+  const props = PropertiesService.getScriptProperties();
+  const current = getDailyYouTubeUnitsUsed_();
+  props.setProperty(dateKey, String(current + units));
+}
+
+function checkYouTubeBudgetBeforeSearchList_() {
+  const budget =
+    Number(getOptionalScriptProperty_('YOUTUBE_DAILY_BUDGET')) ||
+    APP_CONFIG.DEFAULT_YOUTUBE_DAILY_BUDGET;
+  const current = getDailyYouTubeUnitsUsed_();
+  const cutoff = budget * APP_CONFIG.YOUTUBE_BUDGET_CUTOFF_RATIO;
+
+  if (current + 100 > cutoff) {
+    throw createAppError_(
+      'QUOTA_EXCEEDED',
+      'Daily YouTube search quota limit reached (' +
+        Math.round(APP_CONFIG.YOUTUBE_BUDGET_CUTOFF_RATIO * 100) +
+        '% budget cap). Live search is temporarily paused until 00:00 UTC. Cached video roadmaps remain available.'
+    );
+  }
+}
+
+/* ============================================================================
+ * SHA-256 HASH UTILITIES
+ * ========================================================================== */
+
+function computeSha256_(text) {
+  const normalized = String(text || '').replace(/\s+/g, ' ').trim();
+  const digestBytes = Utilities.computeDigest(
+    Utilities.DigestAlgorithm.SHA_256,
+    normalized,
+    Utilities.Charset.UTF_8
+  );
+  let hex = '';
+  for (let i = 0; i < digestBytes.length; i++) {
+    const byteVal = (digestBytes[i] + 256) % 256;
+    const hexPart = byteVal.toString(16);
+    hex += hexPart.length === 1 ? '0' + hexPart : hexPart;
+  }
+  return hex;
+}
+
+function computeHash_(inputStr) {
+  return computeSha256_(inputStr);
+}
+
+/* ============================================================================
+ * SYLLABUS STRUCTURING (GEMINI)
+ * Single-call structuring with fallback model & section-splitting fallback.
+ * ========================================================================== */
 
 function validateAnalyseSyllabusPayload_(payload) {
   if (typeof payload.syllabusText !== 'string') {
@@ -352,210 +576,245 @@ function validateAnalyseSyllabusPayload_(payload) {
   };
 }
 
-/* ============================================================================
- * SERVER-SIDE ABUSE & DUPLICATE REQUEST PROTECTION
- * ========================================================================== */
-
-/**
- * Computes a deterministic content-based hash for duplicate submission detection.
- * Does not identify individual users or IP addresses (unavailable to anonymous
- * Apps Script Web App callers).
- */
-function computeRequestHash_(action, syllabusText) {
-  const normalized = action + ':' + syllabusText.replace(/\s+/g, ' ').trim();
-  const digestBytes = Utilities.computeDigest(
-    Utilities.DigestAlgorithm.SHA_256,
-    normalized,
-    Utilities.Charset.UTF_8
-  );
-
-  let hex = '';
-  for (let i = 0; i < digestBytes.length; i++) {
-    const byteVal = (digestBytes[i] + 256) % 256;
-    const hexPart = byteVal.toString(16);
-    hex += hexPart.length === 1 ? '0' + hexPart : hexPart;
-  }
-  return hex;
-}
-
-function acquireSubmissionGuard_(action, syllabusText) {
-  const requestHash = computeRequestHash_(action, syllabusText);
-  const inflightKey = 'inflight_' + requestHash;
-  const recentKey = 'recent_' + requestHash;
-  const cache = CacheService.getScriptCache();
-  const lock = LockService.getScriptLock();
-
-  let hasLock = false;
-  try {
-    hasLock = lock.tryLock(APP_CONFIG.LOCK_WAIT_MS);
-  } catch (lockErr) {
-    throw createAppError_(
-      'REQUEST_BUSY',
-      'The service is temporarily busy coordinating concurrent requests. Please retry in a moment.'
-    );
-  }
-
-  if (!hasLock) {
-    throw createAppError_(
-      'REQUEST_BUSY',
-      'The service is currently busy handling other requests. Please wait a moment and try again.'
-    );
-  }
-
-  // All shared duplicate-request and global rate-counter cache checks/updates
-  // execute strictly while the script lock is held.
-  try {
-    if (cache.get(inflightKey)) {
-      throw createAppError_(
-        'REQUEST_IN_PROGRESS',
-        'An identical syllabus analysis request is already running. Please wait a moment for it to finish.'
-      );
-    }
-
-    if (cache.get(recentKey)) {
-      throw createAppError_(
-        'REPEATED_REQUEST',
-        'This exact syllabus was just analysed. Please wait ' +
-          APP_CONFIG.DUPLICATE_COOLDOWN_SECONDS +
-          ' seconds before submitting the same text again.'
-      );
-    }
-
-    // Global script-wide per-minute counter across all callers (not per-user).
-    const minuteBucket = Math.floor(
-      Date.now() / (APP_CONFIG.RATE_LIMIT_WINDOW_SECONDS * 1000)
-    );
-    const rateKey = 'rate_' + minuteBucket;
-    const currentCount = Number(cache.get(rateKey) || '0');
-    if (currentCount >= APP_CONFIG.MAX_REQUESTS_PER_MINUTE) {
-      throw createAppError_(
-        'RATE_LIMITED',
-        'The backend is receiving too many analysis requests right now. Please wait a minute and try again.'
-      );
-    }
-
-    cache.put(rateKey, String(currentCount + 1), APP_CONFIG.RATE_LIMIT_WINDOW_SECONDS + 5);
-    cache.put(inflightKey, '1', APP_CONFIG.INFLIGHT_LOCK_SECONDS);
-  } finally {
-    if (hasLock) {
-      try {
-        lock.releaseLock();
-      } catch (releaseErr) {
-        // Ignore lock release failure
-      }
-    }
-  }
-
-  return {
-    inflightKey: inflightKey,
-    recentKey: recentKey,
-  };
-}
-
-function releaseSubmissionGuard_(guard, markCooldown) {
-  if (!guard) return;
-
-  const lock = LockService.getScriptLock();
-  let hasLock = false;
-
-  try {
-    hasLock = lock.tryLock(APP_CONFIG.LOCK_WAIT_MS);
-    if (!hasLock) {
-      // Do not mutate shared cache without holding the script lock;
-      // the inflight key will expire automatically via INFLIGHT_LOCK_SECONDS TTL.
-      return;
-    }
-
-    const cache = CacheService.getScriptCache();
-    cache.remove(guard.inflightKey);
-    if (markCooldown) {
-      cache.put(guard.recentKey, '1', APP_CONFIG.DUPLICATE_COOLDOWN_SECONDS);
-    }
-  } catch (e) {
-    // Non-fatal cleanup error; never mask the primary response or error
-  } finally {
-    if (hasLock) {
-      try {
-        lock.releaseLock();
-      } catch (releaseErr) {
-        // Ignore lock release failure
-      }
-    }
-  }
-}
-
-/* ============================================================================
- * GEMINI SYLLABUS ANALYSIS MODULE
- * ========================================================================== */
-
 function handleAnalyseSyllabus_(payload) {
   const input = validateAnalyseSyllabusPayload_(payload);
-  const primaryApiKey = getRequiredScriptSecret_('GEMINI_API_KEY');
-  const backupApiKey = getOptionalScriptProperty_('GEMINI_API_KEY_BACKUP');
-  const model = getOptionalScriptProperty_('GEMINI_MODEL') || APP_CONFIG.DEFAULT_GEMINI_MODEL;
+  const textHash = computeSha256_(input.syllabusText);
 
+  // 1. Persistent 30-day Cache Check: 0 Gemini calls on cache hit
+  const cachedSyllabus = PersistentStore_.get('syllabus_cache', textHash);
+  if (cachedSyllabus) {
+    return Object.assign({}, cachedSyllabus, {
+      cached: true,
+      telemetry: {
+        geminiCallsUsed: 0,
+        estimatedYoutubeUnitsUsed: 0,
+        cached: true,
+      },
+    });
+  }
+
+  // 2. Daily cap enforcement from reverse proxy
+  if (payload._onlyIfCached) {
+    throw createAppError_(
+      'RATE_LIMITED',
+      'Daily syllabus analysis limit reached. Resets at 00:00 UTC. Cached syllabi remain available.'
+    );
+  }
+
+  // Inflight concurrency guard
   const guard = acquireSubmissionGuard_('analyseSyllabus', input.syllabusText);
   let completedSuccessfully = false;
+  let geminiCallsUsed = 0;
 
   try {
-    const escapedSyllabus = input.syllabusText
-      .replace(/<\/UNTRUSTED_SYLLABUS_DATA>/gi, '<\\/UNTRUSTED_SYLLABUS_DATA>');
+    const primaryModel =
+      getOptionalScriptProperty_('GEMINI_MODEL') || APP_CONFIG.DEFAULT_GEMINI_MODEL;
+    const fallbackModel =
+      getOptionalScriptProperty_('GEMINI_FALLBACK_MODEL') ||
+      APP_CONFIG.DEFAULT_GEMINI_FALLBACK_MODEL;
+    const maxCharsPerCall =
+      Number(getOptionalScriptProperty_('MAX_CHARS_PER_CALL')) ||
+      APP_CONFIG.MAX_CHARS_PER_CALL;
 
-    const userPromptParts = [
-      'Extract only the structured academic syllabus JSON from the untrusted data block below.',
-    ];
-    if (input.sourceFileName) {
-      userPromptParts.push(
-        'Untrusted filename metadata (use only as an optional subject/code hint if valid): ' +
-          input.sourceFileName
-      );
-    }
-    userPromptParts.push('<UNTRUSTED_SYLLABUS_DATA>');
-    userPromptParts.push(escapedSyllabus);
-    userPromptParts.push('</UNTRUSTED_SYLLABUS_DATA>');
+    let structured = null;
 
-    const geminiRequestBody = {
-      systemInstruction: {
-        parts: [{ text: SYLLABUS_SYSTEM_INSTRUCTION }],
-      },
-      contents: [
-        {
-          role: 'user',
-          parts: [{ text: userPromptParts.join('\n') }],
-        },
-      ],
-      generationConfig: {
-        responseMimeType: 'application/json',
-        responseSchema: SYLLABUS_RESPONSE_SCHEMA,
-      },
-    };
-
-    let apiResponse;
-    try {
-      apiResponse = callGeminiGenerateContent_(model, primaryApiKey, geminiRequestBody);
-    } catch (primaryErr) {
-      if (
-        backupApiKey &&
-        backupApiKey !== primaryApiKey &&
-        backupApiKey !== 'MY_GEMINI_API_KEY_BACKUP'
-      ) {
-        console.warn('Primary GEMINI_API_KEY failed, retrying with GEMINI_API_KEY_BACKUP...');
-        apiResponse = callGeminiGenerateContent_(model, backupApiKey, geminiRequestBody);
-      } else {
-        throw primaryErr;
+    // 3. Single-call structuring when within MAX_CHARS_PER_CALL
+    if (input.syllabusText.length <= maxCharsPerCall) {
+      try {
+        geminiCallsUsed++;
+        const requestBody = buildGeminiSyllabusRequestBody_(input.syllabusText, input.sourceFileName);
+        const apiResponse = callGeminiWithBackoffAndFailover_(primaryModel, requestBody);
+        const rawJsonText = extractGeminiTextOutput_(apiResponse);
+        structured = parseAndValidateSyllabusJson_(rawJsonText);
+      } catch (primaryErr) {
+        // Fallback model if first model output fails JSON validation or schema
+        if (fallbackModel && fallbackModel !== primaryModel) {
+          console.warn('Primary model failed validation, trying fallback model ' + fallbackModel);
+          try {
+            geminiCallsUsed++;
+            const fallbackBody = buildGeminiSyllabusRequestBody_(input.syllabusText, input.sourceFileName);
+            const fallbackResponse = callGeminiWithBackoffAndFailover_(fallbackModel, fallbackBody);
+            const rawFallbackText = extractGeminiTextOutput_(fallbackResponse);
+            structured = parseAndValidateSyllabusJson_(rawFallbackText);
+          } catch (fallbackErr) {
+            console.warn('Fallback model failed, attempting section splitting: ' + fallbackErr.message);
+          }
+        }
       }
     }
-    const rawJsonText = extractGeminiTextOutput_(apiResponse);
-    const structured = parseAndValidateSyllabusJson_(rawJsonText);
 
+    // 4. Fallback to section/unit splitting if text is large or single-call failed
+    if (!structured) {
+      structured = structureBySectionsAndMerge_(
+        input.syllabusText,
+        input.sourceFileName,
+        primaryModel,
+        fallbackModel,
+        function () {
+          geminiCallsUsed++;
+        }
+      );
+    }
+
+    // 5. Save structured syllabus to 30-day persistent cache
+    PersistentStore_.set('syllabus_cache', textHash, structured, APP_CONFIG.PERSISTENT_CACHE_TTL_DAYS);
     completedSuccessfully = true;
-    return structured;
+
+    return Object.assign({}, structured, {
+      cached: false,
+      telemetry: {
+        geminiCallsUsed: geminiCallsUsed,
+        estimatedYoutubeUnitsUsed: 0,
+        cached: false,
+      },
+    });
   } finally {
     releaseSubmissionGuard_(guard, completedSuccessfully);
   }
 }
 
-function callGeminiGenerateContent_(model, apiKey, requestBody) {
+function buildGeminiSyllabusRequestBody_(syllabusText, sourceFileName) {
+  const escapedSyllabus = syllabusText.replace(
+    /<\/UNTRUSTED_SYLLABUS_DATA>/gi,
+    '<\\/UNTRUSTED_SYLLABUS_DATA>'
+  );
+
+  const userPromptParts = [
+    'Extract only the structured academic syllabus JSON from the untrusted data block below.',
+  ];
+  if (sourceFileName) {
+    userPromptParts.push(
+      'Untrusted filename metadata (use only as an optional subject/code hint if valid): ' +
+        sourceFileName
+    );
+  }
+  userPromptParts.push('<UNTRUSTED_SYLLABUS_DATA>');
+  userPromptParts.push(escapedSyllabus);
+  userPromptParts.push('</UNTRUSTED_SYLLABUS_DATA>');
+
+  return {
+    systemInstruction: {
+      parts: [{ text: SYLLABUS_SYSTEM_INSTRUCTION }],
+    },
+    contents: [
+      {
+        role: 'user',
+        parts: [{ text: userPromptParts.join('\n') }],
+      },
+    ],
+    generationConfig: {
+      responseMimeType: 'application/json',
+      responseSchema: SYLLABUS_RESPONSE_SCHEMA,
+    },
+  };
+}
+
+/**
+ * Splits large syllabus into logical unit sections, structures each separately,
+ * and merges the units in sequence.
+ */
+function structureBySectionsAndMerge_(syllabusText, sourceFileName, primaryModel, fallbackModel, onCall) {
+  const sections = splitSyllabusIntoUnitSections_(syllabusText);
+  let mergedSubject = '';
+  let mergedCode = '';
+  const mergedUnits = [];
+  const mergedFlags = [];
+
+  for (let i = 0; i < sections.length; i++) {
+    const secText = sections[i];
+    if (onCall) onCall();
+
+    let structuredSec = null;
+    try {
+      const body = buildGeminiSyllabusRequestBody_(secText, sourceFileName);
+      const res = callGeminiWithBackoffAndFailover_(primaryModel, body);
+      structuredSec = parseAndValidateSyllabusJson_(extractGeminiTextOutput_(res));
+    } catch (e1) {
+      if (fallbackModel && fallbackModel !== primaryModel) {
+        if (onCall) onCall();
+        const fbBody = buildGeminiSyllabusRequestBody_(secText, sourceFileName);
+        const fbRes = callGeminiWithBackoffAndFailover_(fallbackModel, fbBody);
+        structuredSec = parseAndValidateSyllabusJson_(extractGeminiTextOutput_(fbRes));
+      } else {
+        throw e1;
+      }
+    }
+
+    if (structuredSec) {
+      if (!mergedSubject && structuredSec.subject) mergedSubject = structuredSec.subject;
+      if (!mergedCode && structuredSec.subjectCode) mergedCode = structuredSec.subjectCode;
+      if (Array.isArray(structuredSec.verificationFlags)) {
+        mergedFlags.push.apply(mergedFlags, structuredSec.verificationFlags);
+      }
+      if (Array.isArray(structuredSec.units)) {
+        for (let u = 0; u < structuredSec.units.length; u++) {
+          const unit = structuredSec.units[u];
+          unit.unitNumber = mergedUnits.length + 1;
+          mergedUnits.push(unit);
+        }
+      }
+    }
+  }
+
+  return {
+    subject: mergedSubject,
+    subjectCode: mergedCode,
+    isIncomplete: false,
+    verificationFlags: mergedFlags,
+    units: mergedUnits,
+  };
+}
+
+function splitSyllabusIntoUnitSections_(text) {
+  const lines = text.split(/\r?\n/);
+  const sections = [];
+  let current = [];
+  const unitRegex = /^(?:unit|module|chapter|section|part)\s*(?:[0-9]+|[ivxlcdm]+)\b/i;
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if (unitRegex.test(line.trim()) && current.length > 5) {
+      sections.push(current.join('\n'));
+      current = [line];
+    } else {
+      current.push(line);
+      // Hard length limit per section (approx 12,000 characters)
+      if (current.join('\n').length > 12000) {
+        sections.push(current.join('\n'));
+        current = [];
+      }
+    }
+  }
+  if (current.length > 0) {
+    sections.push(current.join('\n'));
+  }
+  return sections.length > 0 ? sections : [text];
+}
+
+/* ============================================================================
+ * GEMINI API CALL WITH EXPONENTIAL BACKOFF, JITTER, AND FAILOVER KEY
+ * ========================================================================== */
+
+function callGeminiWithBackoffAndFailover_(model, requestBody) {
+  const primaryApiKey = getRequiredScriptSecret_('GEMINI_API_KEY');
+  const backupApiKey = getOptionalScriptProperty_('GEMINI_API_KEY_BACKUP');
+
+  try {
+    return callGeminiWithRetry_(model, primaryApiKey, requestBody);
+  } catch (primaryErr) {
+    if (
+      backupApiKey &&
+      backupApiKey !== primaryApiKey &&
+      backupApiKey !== 'MY_GEMINI_API_KEY_BACKUP'
+    ) {
+      console.warn('Primary Gemini key failed, failing over to GEMINI_API_KEY_BACKUP...');
+      return callGeminiWithRetry_(model, backupApiKey, requestBody);
+    }
+    throw primaryErr;
+  }
+}
+
+function callGeminiWithRetry_(model, apiKey, requestBody) {
   const url =
     APP_CONFIG.GEMINI_API_BASE +
     '/' +
@@ -585,7 +844,9 @@ function callGeminiGenerateContent_(model, apiKey, requestBody) {
         apiKey
       );
       if (attempt < APP_CONFIG.MAX_RETRY_ATTEMPTS) {
-        Utilities.sleep(APP_CONFIG.RETRY_BASE_DELAY_MS * attempt);
+        // Exponential backoff with random jitter
+        const delay = APP_CONFIG.RETRY_BASE_DELAY_MS * Math.pow(2, attempt - 1) + Math.floor(Math.random() * 250);
+        Utilities.sleep(delay);
         continue;
       }
       throw createAppError_('GEMINI_NETWORK_ERROR', lastErrorMessage);
@@ -608,12 +869,13 @@ function callGeminiGenerateContent_(model, apiKey, requestBody) {
     lastUpstreamStatus = upstreamStatus;
     lastErrorMessage = extractUpstreamGeminiError_(responseBodyText, upstreamStatus, apiKey);
 
-    // Retry transient rate-limit / high-demand responses from Gemini
+    // Retry 429 or 5xx with exponential backoff & jitter
     if (
-      (upstreamStatus === 429 || upstreamStatus === 503) &&
+      (upstreamStatus === 429 || upstreamStatus >= 500) &&
       attempt < APP_CONFIG.MAX_RETRY_ATTEMPTS
     ) {
-      Utilities.sleep(APP_CONFIG.RETRY_BASE_DELAY_MS * attempt);
+      const delay = APP_CONFIG.RETRY_BASE_DELAY_MS * Math.pow(2, attempt - 1) + Math.floor(Math.random() * 250);
+      Utilities.sleep(delay);
       continue;
     }
 
@@ -634,650 +896,263 @@ function callGeminiGenerateContent_(model, apiKey, requestBody) {
   ) {
     throw createAppError_(
       'GEMINI_AUTH_ERROR',
-      'Gemini API authentication failed. Please check the GEMINI_API_KEY in Apps Script Script Properties.'
+      'Gemini API authentication failed. Verify GEMINI_API_KEY in Apps Script Script Properties.'
     );
   }
 
-  if (lastUpstreamStatus === 404) {
-    throw createAppError_(
-      'GEMINI_MODEL_NOT_FOUND',
-      'Configured Gemini model "' + model + '" was not found or is unsupported.'
-    );
-  }
-
-  if (lastUpstreamStatus === 503) {
+  if (lastUpstreamStatus >= 500) {
     throw createAppError_(
       'GEMINI_UNAVAILABLE',
-      'Gemini AI service is temporarily experiencing high demand. Please retry shortly.'
+      'Gemini API is temporarily unavailable. Please retry in a few moments.'
     );
   }
 
-  throw createAppError_('GEMINI_API_ERROR', lastErrorMessage);
+  throw createAppError_('GEMINI_ERROR', lastErrorMessage);
 }
 
 function extractGeminiTextOutput_(apiResponse) {
-  if (!apiResponse || typeof apiResponse !== 'object') {
+  if (
+    !apiResponse ||
+    !Array.isArray(apiResponse.candidates) ||
+    apiResponse.candidates.length === 0
+  ) {
     throw createAppError_(
-      'GEMINI_EMPTY_RESPONSE',
-      'Gemini API returned an empty response.'
+      'GEMINI_NO_CANDIDATES',
+      'Gemini returned no response candidates for the syllabus content.'
     );
   }
 
-  if (apiResponse.promptFeedback && apiResponse.promptFeedback.blockReason) {
-    throw createAppError_(
-      'GEMINI_BLOCKED',
-      'The syllabus request was blocked by Gemini safety filters (' +
-        apiResponse.promptFeedback.blockReason +
-        ').'
-    );
-  }
-
-  const candidates = Array.isArray(apiResponse.candidates) ? apiResponse.candidates : [];
-  if (candidates.length === 0) {
-    throw createAppError_(
-      'GEMINI_EMPTY_RESPONSE',
-      'Gemini did not return any analysis candidates. Please retry.'
-    );
-  }
-
-  const firstCandidate = candidates[0];
-  if (firstCandidate.finishReason === 'SAFETY' || firstCandidate.finishReason === 'RECITATION') {
-    throw createAppError_(
-      'GEMINI_BLOCKED',
-      'Gemini could not complete syllabus analysis (' + firstCandidate.finishReason + ').'
-    );
+  const firstCandidate = apiResponse.candidates[0];
+  if (
+    firstCandidate.finishReason &&
+    firstCandidate.finishReason !== 'STOP' &&
+    firstCandidate.finishReason !== 'MAX_TOKENS'
+  ) {
+    if (firstCandidate.finishReason === 'SAFETY') {
+      throw createAppError_(
+        'GEMINI_SAFETY_BLOCKED',
+        'Gemini blocked the syllabus response under safety guidelines.'
+      );
+    }
   }
 
   const parts =
     firstCandidate.content && Array.isArray(firstCandidate.content.parts)
       ? firstCandidate.content.parts
       : [];
-
-  const textChunks = [];
+  let concatenatedText = '';
   for (let i = 0; i < parts.length; i++) {
-    const part = parts[i];
-    if (part && typeof part.text === 'string' && !part.thought) {
-      textChunks.push(part.text);
+    if (parts[i] && typeof parts[i].text === 'string') {
+      concatenatedText += parts[i].text;
     }
   }
 
-  const combinedText = textChunks.join('').trim();
-  if (!combinedText) {
+  if (!concatenatedText.trim()) {
     throw createAppError_(
       'GEMINI_EMPTY_RESPONSE',
-      'Gemini returned empty text output. Please retry syllabus analysis.'
+      'Gemini returned an empty text response for the syllabus.'
     );
   }
 
-  return combinedText;
+  return concatenatedText.trim();
 }
 
 function parseAndValidateSyllabusJson_(rawText) {
-  let cleanedText = rawText.trim();
-  if (cleanedText.indexOf('```') === 0) {
-    cleanedText = cleanedText
-      .replace(/^```(?:json)?\s*/i, '')
-      .replace(/\s*```$/, '')
-      .trim();
+  let cleaned = rawText.trim();
+  const markdownJsonMatch = cleaned.match(/```(?:json)?\s*([\s\S]*?)\s*```/i);
+  if (markdownJsonMatch && markdownJsonMatch[1]) {
+    cleaned = markdownJsonMatch[1].trim();
   }
 
   let parsed;
   try {
-    parsed = JSON.parse(cleanedText);
+    parsed = JSON.parse(cleaned);
   } catch (err) {
     throw createAppError_(
-      'INVALID_MODEL_JSON',
-      'Gemini returned invalid JSON that could not be parsed. Please retry.'
+      'SYLLABUS_PARSE_ERROR',
+      'AI returned malformed JSON structure: ' + (err.message || '')
     );
   }
 
   if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
     throw createAppError_(
-      'INVALID_MODEL_SCHEMA',
-      'Structured syllabus response must be a JSON object.'
+      'SYLLABUS_SCHEMA_INVALID',
+      'Expected a JSON object root representing the syllabus.'
     );
   }
 
-  if (typeof parsed.subject !== 'string' || typeof parsed.subjectCode !== 'string') {
-    throw createAppError_(
-      'INVALID_MODEL_SCHEMA',
-      'Structured syllabus JSON is missing valid "subject" or "subjectCode" fields.'
-    );
-  }
-
-  if (!Array.isArray(parsed.units)) {
-    throw createAppError_(
-      'INVALID_MODEL_SCHEMA',
-      'Structured syllabus JSON is missing a valid "units" array.'
-    );
-  }
-
-  const normalizedUnits = [];
-  for (let i = 0; i < parsed.units.length; i++) {
-    const rawUnit = parsed.units[i];
-    if (!rawUnit || typeof rawUnit !== 'object' || Array.isArray(rawUnit)) {
-      continue;
-    }
-
-    const unitNumber =
-      typeof rawUnit.unitNumber === 'number' &&
-      isFinite(rawUnit.unitNumber) &&
-      rawUnit.unitNumber > 0
-        ? Math.round(rawUnit.unitNumber)
-        : i + 1;
-
-    const unitName = typeof rawUnit.unitName === 'string' ? rawUnit.unitName.trim() : '';
-    const rawTopics = Array.isArray(rawUnit.topics) ? rawUnit.topics : [];
-
-    const seenTopics = {};
-    const normalizedTopics = [];
-
-    for (let j = 0; j < rawTopics.length; j++) {
-      const rawTopic = rawTopics[j];
-      if (!rawTopic || typeof rawTopic !== 'object' || Array.isArray(rawTopic)) {
-        continue;
-      }
-
-      const topicName =
-        typeof rawTopic.topicName === 'string' ? rawTopic.topicName.trim() : '';
-      if (!topicName) continue;
-
-      const dedupeKey = topicName.toLowerCase();
-      if (seenTopics[dedupeKey]) continue;
-      seenTopics[dedupeKey] = true;
-
-      const rawSubtopics = Array.isArray(rawTopic.subtopics) ? rawTopic.subtopics : [];
-      const seenSubs = {};
-      const subtopics = [];
-
-      for (let k = 0; k < rawSubtopics.length; k++) {
-        const sub = rawSubtopics[k];
-        if (typeof sub !== 'string') continue;
-        const cleanSub = sub.trim();
-        if (!cleanSub) continue;
-        const subKey = cleanSub.toLowerCase();
-        if (seenSubs[subKey]) continue;
-        seenSubs[subKey] = true;
-        subtopics.push(cleanSub);
-      }
-
-      normalizedTopics.push({
-        topicName: topicName,
-        subtopics: subtopics,
-        needsVerification: Boolean(rawTopic.needsVerification),
-      });
-    }
-
-    if (normalizedTopics.length > 0 || unitName) {
-      normalizedUnits.push({
-        unitNumber: unitNumber,
-        unitName: unitName,
-        topics: normalizedTopics,
-      });
-    }
-  }
-
-  if (normalizedUnits.length === 0) {
-    throw createAppError_(
-      'NO_TOPICS_EXTRACTED',
-      'No syllabus units or topics could be extracted from this text. Please verify the text contains valid course topics.'
-    );
-  }
+  const subject = typeof parsed.subject === 'string' ? parsed.subject.trim() : '';
+  const subjectCode =
+    typeof parsed.subjectCode === 'string' ? parsed.subjectCode.trim() : '';
+  const isIncomplete = Boolean(parsed.isIncomplete);
 
   const verificationFlags = [];
   if (Array.isArray(parsed.verificationFlags)) {
     for (let i = 0; i < parsed.verificationFlags.length; i++) {
       const flag = parsed.verificationFlags[i];
-      if (!flag || typeof flag !== 'object' || Array.isArray(flag)) continue;
-      const message = typeof flag.message === 'string' ? flag.message.trim() : '';
-      if (!message) continue;
-      const location =
-        typeof flag.location === 'string' && flag.location.trim()
-          ? flag.location.trim()
-          : 'Syllabus';
-      verificationFlags.push({
-        location: location,
-        message: message,
+      if (flag && typeof flag === 'object') {
+        const location =
+          typeof flag.location === 'string' ? flag.location.trim() : '';
+        const issue = typeof flag.issue === 'string' ? flag.issue.trim() : '';
+        if (location || issue) {
+          verificationFlags.push({ location: location, issue: issue });
+        }
+      }
+    }
+  }
+
+  if (!Array.isArray(parsed.units) || parsed.units.length === 0) {
+    throw createAppError_(
+      'SYLLABUS_NO_UNITS',
+      'No course units or modules could be extracted from the syllabus text.'
+    );
+  }
+
+  const units = [];
+  for (let u = 0; u < parsed.units.length; u++) {
+    const rawUnit = parsed.units[u];
+    if (!rawUnit || typeof rawUnit !== 'object') continue;
+
+    const unitNumber =
+      typeof rawUnit.unitNumber === 'number' && rawUnit.unitNumber > 0
+        ? Math.floor(rawUnit.unitNumber)
+        : u + 1;
+    const unitName =
+      typeof rawUnit.unitName === 'string' ? rawUnit.unitName.trim() : '';
+
+    const rawTopics = Array.isArray(rawUnit.topics) ? rawUnit.topics : [];
+    const topics = [];
+
+    for (let t = 0; t < rawTopics.length; t++) {
+      const rawTopic = rawTopics[t];
+      let topicName = '';
+      let subtopics = [];
+      let needsVerification = false;
+
+      if (typeof rawTopic === 'string') {
+        topicName = rawTopic.trim();
+      } else if (rawTopic && typeof rawTopic === 'object') {
+        topicName =
+          typeof rawTopic.topicName === 'string' ? rawTopic.topicName.trim() : '';
+        if (Array.isArray(rawTopic.subtopics)) {
+          for (let s = 0; s < rawTopic.subtopics.length; s++) {
+            if (
+              typeof rawTopic.subtopics[s] === 'string' &&
+              rawTopic.subtopics[s].trim()
+            ) {
+              subtopics.push(rawTopic.subtopics[s].trim());
+            }
+          }
+        }
+        needsVerification = Boolean(rawTopic.needsVerification);
+      }
+
+      if (topicName) {
+        topics.push({
+          topicName: topicName,
+          subtopics: subtopics,
+          needsVerification: needsVerification,
+        });
+      }
+    }
+
+    if (topics.length > 0) {
+      units.push({
+        unitNumber: unitNumber,
+        unitName: unitName,
+        topics: topics,
       });
     }
   }
 
+  if (units.length === 0) {
+    throw createAppError_(
+      'SYLLABUS_NO_TOPICS',
+      'No valid course topics were extracted from the syllabus.'
+    );
+  }
+
   return {
-    subject: parsed.subject.trim(),
-    subjectCode: parsed.subjectCode.trim(),
-    units: normalizedUnits,
+    subject: subject,
+    subjectCode: subjectCode,
+    isIncomplete: isIncomplete,
     verificationFlags: verificationFlags,
-    isIncomplete: Boolean(parsed.isIncomplete),
+    units: units,
   };
 }
 
 /* ============================================================================
- * YOUTUBE DATA API V3 SEARCH MODULE
+ * TOPIC-TO-CANDIDATE VIDEO MAPPING (ONE GEMINI CALL PER UNIT)
  * ========================================================================== */
 
-const YOUTUBE_LANGUAGE_MAP = {
-  english: 'en',
-  hindi: 'hi',
-  marathi: 'mr',
-};
-
-/**
- * Handles the `searchYouTubeVideos` batch topic search action using
- * YouTube Data API v3 (`https://www.googleapis.com/youtube/v3/search`).
- * Returns actual YouTube metadata for each requested topic and caches
- * successful per-topic responses for ~6 hours.
- */
-function handleSearchYouTubeVideos_(payload) {
-  const input = validateSearchYouTubeVideosPayload_(payload);
-  const apiKey = getYouTubeApiKey_();
-
-  const results = [];
-  let rateLimitChecked = false;
-
-  for (let i = 0; i < input.topics.length; i++) {
-    const topic = input.topics[i];
-    const cacheKey =
-      'yt_s3_' +
-      computeHash_(
-        JSON.stringify({
-          topic: topic.toLowerCase(),
-          relevanceLanguage: input.relevanceLanguage,
-          maxResults: input.maxResults,
-          regionCode: input.regionCode,
-        })
-      );
-
-    const cachedTopicResult = getCachedJson_(cacheKey);
-    if (cachedTopicResult && Array.isArray(cachedTopicResult.videos)) {
-      results.push({
-        topic: topic,
-        videos: cachedTopicResult.videos,
-      });
-      continue;
-    }
-
-    if (!rateLimitChecked) {
-      enforceYouTubeRateLimit_();
-      rateLimitChecked = true;
-    }
-
-    const rawItems = fetchYouTubeSearchResultsForTopic_(
-      {
-        topic: topic,
-        relevanceLanguage: input.relevanceLanguage,
-        maxResults: input.maxResults,
-        regionCode: input.regionCode,
-      },
-      apiKey
-    );
-
-    const formattedVideos = formatYouTubeSearchItems_(rawItems);
-    const topicResult = {
-      topic: topic,
-      videos: formattedVideos,
-    };
-
-    // Only cache successful API responses (errors throw before reaching here).
-    setCachedJson_(cacheKey, topicResult, APP_CONFIG.YOUTUBE_CACHE_TTL_SECONDS);
-    results.push(topicResult);
+function mapUnitTopicsToVideosWithGemini_(subject, unitTitle, topics, candidateVideos) {
+  if (!topics || topics.length === 0 || !candidateVideos || candidateVideos.length === 0) {
+    return {};
   }
 
-  return {
-    results: results,
+  const model =
+    getOptionalScriptProperty_('GEMINI_MODEL') || APP_CONFIG.DEFAULT_GEMINI_MODEL;
+
+  const topicsList = topics.map(function (t, idx) {
+    return (idx + 1) + '. ' + t.topicName + (t.subtopics && t.subtopics.length ? ' (' + t.subtopics.join(', ') + ')' : '');
+  }).join('\n');
+
+  const candidatesList = candidateVideos.slice(0, 35).map(function (v, idx) {
+    return 'Video ID ' + v.videoId + ': "' + v.title + '" by ' + v.channelTitle;
+  }).join('\n');
+
+  const prompt = [
+    'You are an educational video curator matching university syllabus topics to YouTube lectures.',
+    'Subject: ' + (subject || 'General Engineering'),
+    'Unit: ' + (unitTitle || 'Unit'),
+    '',
+    'Syllabus Topics:',
+    topicsList,
+    '',
+    'Candidate Lecture Videos:',
+    candidatesList,
+    '',
+    'Task: For each topic, select the single best matching video ID and provide a 1-sentence explanation of why it covers that topic.',
+    'Output JSON schema:',
+    '{',
+    '  "matches": [',
+    '    { "topicName": "...", "videoId": "...", "explanation": "..." }',
+    '  ]',
+    '}',
+  ].join('\n');
+
+  const requestBody = {
+    contents: [{ role: 'user', parts: [{ text: prompt }] }],
+    generationConfig: { responseMimeType: 'application/json' },
   };
-}
 
-function validateSearchYouTubeVideosPayload_(payload) {
-  if (!Array.isArray(payload.topics) || payload.topics.length === 0) {
-    throw createAppError_(
-      'MISSING_TOPICS',
-      'Missing or invalid "topics" array. Provide between 1 and ' +
-        APP_CONFIG.MAX_YOUTUBE_TOPICS_PER_REQUEST +
-        ' syllabus topics.'
-    );
-  }
-
-  if (payload.topics.length > APP_CONFIG.MAX_YOUTUBE_TOPICS_PER_REQUEST) {
-    throw createAppError_(
-      'TOO_MANY_TOPICS',
-      'A maximum of ' +
-        APP_CONFIG.MAX_YOUTUBE_TOPICS_PER_REQUEST +
-        ' topics may be searched per request.'
-    );
-  }
-
-  const normalizedTopics = [];
-  for (let i = 0; i < payload.topics.length; i++) {
-    const rawTopic = payload.topics[i];
-    if (typeof rawTopic !== 'string') {
-      throw createAppError_(
-        'INVALID_TOPIC',
-        'Topic at index ' + i + ' must be a non-empty string.'
-      );
-    }
-
-    const cleanTopic = rawTopic.replace(/\s+/g, ' ').trim();
-    if (!cleanTopic) {
-      throw createAppError_(
-        'EMPTY_TOPIC',
-        'Topic at index ' + i + ' cannot be empty.'
-      );
-    }
-
-    if (cleanTopic.length > APP_CONFIG.MAX_YOUTUBE_TOPIC_CHARS) {
-      throw createAppError_(
-        'TOPIC_TOO_LONG',
-        'Topic at index ' +
-          i +
-          ' exceeds the ' +
-          APP_CONFIG.MAX_YOUTUBE_TOPIC_CHARS +
-          ' character limit.'
-      );
-    }
-
-    normalizedTopics.push(cleanTopic);
-  }
-
-  let maxResults = APP_CONFIG.DEFAULT_YOUTUBE_MAX_RESULTS;
-  if (payload.maxResults !== undefined && payload.maxResults !== null && payload.maxResults !== '') {
-    const isNumericType =
-      typeof payload.maxResults === 'number' || typeof payload.maxResults === 'string';
-    const parsedMax = isNumericType ? Number(payload.maxResults) : NaN;
-    if (
-      !isNumericType ||
-      !isFinite(parsedMax) ||
-      Math.floor(parsedMax) !== parsedMax ||
-      parsedMax < APP_CONFIG.MIN_YOUTUBE_RESULTS ||
-      parsedMax > APP_CONFIG.MAX_YOUTUBE_RESULTS
-    ) {
-      throw createAppError_(
-        'INVALID_MAX_RESULTS',
-        '"maxResults" must be an integer between ' +
-          APP_CONFIG.MIN_YOUTUBE_RESULTS +
-          ' and ' +
-          APP_CONFIG.MAX_YOUTUBE_RESULTS +
-          '.'
-      );
-    }
-    maxResults = parsedMax;
-  }
-
-  let regionCode = APP_CONFIG.DEFAULT_YOUTUBE_REGION_CODE;
-  if (payload.regionCode !== undefined && payload.regionCode !== null) {
-    if (typeof payload.regionCode !== 'string') {
-      throw createAppError_(
-        'INVALID_REGION_CODE',
-        '"regionCode" must be a 2-letter ISO country code (for example, "IN").'
-      );
-    }
-    const cleanRegion = payload.regionCode.trim().toUpperCase();
-    if (cleanRegion) {
-      if (!/^[A-Z]{2}$/.test(cleanRegion)) {
-        throw createAppError_(
-          'INVALID_REGION_CODE',
-          '"regionCode" must be a valid 2-letter uppercase ISO country code (for example, "IN").'
-        );
+  try {
+    const apiResponse = callGeminiWithBackoffAndFailover_(model, requestBody);
+    const rawText = extractGeminiTextOutput_(apiResponse);
+    const parsed = JSON.parse(rawText);
+    const mapping = {};
+    if (parsed && Array.isArray(parsed.matches)) {
+      for (let i = 0; i < parsed.matches.length; i++) {
+        const m = parsed.matches[i];
+        if (m && m.topicName && m.videoId) {
+          mapping[m.topicName.toLowerCase().trim()] = {
+            videoId: m.videoId,
+            explanation: m.explanation || '',
+          };
+        }
       }
-      regionCode = cleanRegion;
     }
+    return mapping;
+  } catch (err) {
+    console.warn('1-call Gemini unit mapping failed, falling back to local fuzzy match: ' + err.message);
+    return {};
   }
-
-  const languageRaw = typeof payload.language === 'string' ? payload.language.trim() : '';
-  const relevanceLanguage = mapLanguageToRelevanceCode_(languageRaw);
-
-  return {
-    topics: normalizedTopics,
-    language: languageRaw,
-    relevanceLanguage: relevanceLanguage,
-    maxResults: maxResults,
-    regionCode: regionCode,
-  };
 }
 
-function mapLanguageToRelevanceCode_(language) {
-  if (!language || typeof language !== 'string') return '';
-  const key = language.trim().toLowerCase();
-  if (Object.prototype.hasOwnProperty.call(YOUTUBE_LANGUAGE_MAP, key)) {
-    return YOUTUBE_LANGUAGE_MAP[key];
-  }
-  return '';
-}
-
-function fetchYouTubeSearchResultsForTopic_(opts, apiKey) {
-  const params = {
-    part: 'snippet',
-    type: 'video',
-    q: opts.topic,
-    maxResults: String(opts.maxResults),
-    regionCode: opts.regionCode || APP_CONFIG.DEFAULT_YOUTUBE_REGION_CODE,
-    order: 'relevance',
-    safeSearch: 'moderate',
-  };
-
-  if (opts.relevanceLanguage) {
-    params.relevanceLanguage = opts.relevanceLanguage;
-  }
-
-  const data = callYouTubeApiJson_('/search', params, apiKey);
-  return Array.isArray(data.items) ? data.items : [];
-}
-
-function formatYouTubeSearchItems_(items) {
-  const videos = [];
-  if (!Array.isArray(items)) return videos;
-
-  for (let i = 0; i < items.length; i++) {
-    const item = items[i];
-    const videoId =
-      item && item.id && typeof item.id.videoId === 'string' ? item.id.videoId.trim() : '';
-    if (!videoId) continue;
-
-    const snippet = item && item.snippet && typeof item.snippet === 'object' ? item.snippet : {};
-    const thumbnails =
-      snippet.thumbnails && typeof snippet.thumbnails === 'object' ? snippet.thumbnails : {};
-
-    let thumbnailUrl = '';
-    if (thumbnails.high && typeof thumbnails.high.url === 'string') {
-      thumbnailUrl = thumbnails.high.url;
-    } else if (thumbnails.medium && typeof thumbnails.medium.url === 'string') {
-      thumbnailUrl = thumbnails.medium.url;
-    } else if (thumbnails.default && typeof thumbnails.default.url === 'string') {
-      thumbnailUrl = thumbnails.default.url;
-    }
-
-    videos.push({
-      videoId: videoId,
-      title: decodeHtmlEntities_(typeof snippet.title === 'string' ? snippet.title : ''),
-      description: decodeHtmlEntities_(
-        typeof snippet.description === 'string' ? snippet.description : ''
-      ),
-      channelTitle: decodeHtmlEntities_(
-        typeof snippet.channelTitle === 'string' ? snippet.channelTitle : ''
-      ),
-      channelId: typeof snippet.channelId === 'string' ? snippet.channelId : '',
-      publishedAt: typeof snippet.publishedAt === 'string' ? snippet.publishedAt : '',
-      thumbnailUrl: thumbnailUrl,
-      videoUrl: 'https://www.youtube.com/watch?v=' + videoId,
-    });
-  }
-
-  return videos;
-}
-
-const COUNTRY_TO_REGION_CODE = {
-  India: 'IN',
-  'United States': 'US',
-  'United Kingdom': 'GB',
-  Global: '',
-};
-
-const KNOWN_INDIAN_EDUCATOR_PATTERNS = [
-  'nptel',
-  'gate smashers',
-  'neso academy',
-  'abdul bari',
-  "jenny's lectures",
-  'jennys lectures',
-  'codewithharry',
-  'apna college',
-  'physics wallah',
-  'pw ',
-  'unacademy',
-  'gajendra purohit',
-  'tutorials point',
-  'tutorialspoint',
-  'geeksforgeeks',
-  '5 minutes engineering',
-  'last moment tuitions',
-  'knowledgegate',
-  'knowledge gate',
-  'all about electronics',
-  'easy engineering',
-  'tikle',
-  'edureka',
-  'sudhakar atchala',
-  'education 4u',
-  'sandeep saradhi',
-  'iit',
-  'aktu',
-  'sppu',
-  'vtu',
-  'makaut',
-];
-
-function handleSearchTopicVideos_(payload) {
-  const input = validateSearchTopicVideosPayload_(payload);
-  const apiKey = getYouTubeApiKey_();
-
-  const cacheHash = computeHash_(
-    JSON.stringify({
-      topicName: input.topicName.toLowerCase(),
-      subject: input.subject.toLowerCase(),
-      subtopics: input.subtopics,
-      preferences: input.preferences,
-    })
-  );
-  const resultCacheKey = 'yt_res_' + cacheHash;
-
-  const cachedResult = getCachedJson_(resultCacheKey);
-  if (cachedResult) {
-    return Object.assign({}, cachedResult, { cached: true });
-  }
-
-  enforceYouTubeRateLimit_();
-
-  const prefs = input.preferences;
-  const regionCode = COUNTRY_TO_REGION_CODE[prefs.preferredCountry] || '';
-  const queryUsed = buildYouTubeSearchQuery_(input);
-
-  const resolvedChannels = resolvePreferredChannelIds_(
-    prefs.preferredChannels,
-    regionCode,
-    apiKey
-  );
-
-  const rawSearchItems = [];
-  const seenVideoIds = {};
-
-  const addUniqueItems = function (items) {
-    for (let i = 0; i < items.length; i++) {
-      const item = items[i];
-      const videoId =
-        item && item.id && typeof item.id.videoId === 'string' ? item.id.videoId : '';
-      if (!videoId || seenVideoIds[videoId]) continue;
-      seenVideoIds[videoId] = true;
-      rawSearchItems.push(item);
-    }
-  };
-
-  // 1. Channel-specific search for up to 3 resolved preferred channels
-  const channelSearchCap = Math.min(resolvedChannels.length, 3);
-  for (let i = 0; i < channelSearchCap; i++) {
-    const ch = resolvedChannels[i];
-    const perChannelMax = Math.min(Math.max(prefs.videosPerTopic, 3), 8);
-    const channelItems = searchYouTubeVideosApi_(
-      {
-        q: buildTopicOnlyQuery_(input),
-        channelId: ch.channelId,
-        regionCode: regionCode,
-        relevanceLanguage: getPrimaryRelevanceLanguage_(prefs.languages),
-        maxResults: perChannelMax,
-      },
-      apiKey
-    );
-    addUniqueItems(channelItems);
-  }
-
-  // 2. General topic search when no preferred channels, or fallback allowed, or need more results
-  const needGeneralSearch =
-    resolvedChannels.length === 0 ||
-    prefs.allowFallbackChannels ||
-    rawSearchItems.length < prefs.videosPerTopic;
-
-  if (needGeneralSearch) {
-    const generalMax = Math.min(Math.max(prefs.videosPerTopic * 3, 10), 25);
-    const generalItems = searchYouTubeVideosApi_(
-      {
-        q: queryUsed,
-        regionCode: regionCode,
-        relevanceLanguage: getPrimaryRelevanceLanguage_(prefs.languages),
-        maxResults: generalMax,
-      },
-      apiKey
-    );
-    addUniqueItems(generalItems);
-  }
-
-  if (rawSearchItems.length === 0) {
-    const emptyPayload = {
-      topicName: input.topicName,
-      queryUsed: queryUsed,
-      videos: [],
-      cached: false,
-    };
-    setCachedJson_(resultCacheKey, emptyPayload, APP_CONFIG.YOUTUBE_CACHE_TTL_SECONDS);
-    return emptyPayload;
-  }
-
-  // 3. Enrich with video durations, view counts, audio languages, and channel countries
-  const videoIds = rawSearchItems.map(function (item) {
-    return item.id.videoId;
-  });
-  const videoDetailsMap = fetchYouTubeVideoDetailsMap_(videoIds, apiKey);
-
-  const channelIdSet = {};
-  const channelIds = [];
-  for (let i = 0; i < rawSearchItems.length; i++) {
-    const item = rawSearchItems[i];
-    const chId =
-      item && item.snippet && typeof item.snippet.channelId === 'string'
-        ? item.snippet.channelId
-        : '';
-    if (chId && !channelIdSet[chId]) {
-      channelIdSet[chId] = true;
-      channelIds.push(chId);
-    }
-  }
-  const channelCountryMap = fetchYouTubeChannelCountryMap_(channelIds, apiKey);
-
-  // 4. Score, filter, and rank videos according to user preferences
-  const rankedVideos = rankAndFormatYouTubeVideos_(
-    rawSearchItems,
-    videoDetailsMap,
-    channelCountryMap,
-    input
-  );
-
-  const responsePayload = {
-    topicName: input.topicName,
-    queryUsed: queryUsed,
-    videos: rankedVideos,
-    cached: false,
-  };
-
-  setCachedJson_(resultCacheKey, responsePayload, APP_CONFIG.YOUTUBE_CACHE_TTL_SECONDS);
-  return responsePayload;
-}
+/* ============================================================================
+ * YOUTUBE PLAYLIST-FIRST & TOPIC VIDEO SEARCH
+ * Playlist-first fetch -> local token fuzzy scoring -> batch videos.list
+ * ========================================================================== */
 
 function validateSearchTopicVideosPayload_(payload) {
   if (typeof payload.topicName !== 'string' || !payload.topicName.trim()) {
@@ -1290,6 +1165,8 @@ function validateSearchTopicVideosPayload_(payload) {
   const topicName = payload.topicName.trim().slice(0, 300);
   const subject =
     typeof payload.subject === 'string' ? payload.subject.trim().slice(0, 200) : '';
+  const unitTitle =
+    typeof payload.unitTitle === 'string' ? payload.unitTitle.trim().slice(0, 200) : '';
 
   const subtopics = [];
   if (Array.isArray(payload.subtopics)) {
@@ -1364,6 +1241,7 @@ function validateSearchTopicVideosPayload_(payload) {
   return {
     topicName: topicName,
     subject: subject,
+    unitTitle: unitTitle,
     subtopics: subtopics,
     preferences: {
       preferredCountry: preferredCountry,
@@ -1377,152 +1255,473 @@ function validateSearchTopicVideosPayload_(payload) {
   };
 }
 
-function enforceYouTubeRateLimit_() {
-  const lock = LockService.getScriptLock();
-  let hasLock = false;
+/**
+ * Handles YouTube video search for a single topic using Playlist-First search.
+ */
+function handleSearchTopicVideos_(payload) {
+  const input = validateSearchTopicVideosPayload_(payload);
+  const apiKey = getYouTubeApiKey_();
 
-  try {
-    hasLock = lock.tryLock(APP_CONFIG.LOCK_WAIT_MS);
-  } catch (lockErr) {
+  // 1. Topic Cache Check (30-day persistent cache)
+  const topicCacheKey = computeHash_(
+    'topic:' +
+      input.subject.toLowerCase() +
+      ':' +
+      input.unitTitle.toLowerCase() +
+      ':' +
+      input.topicName.toLowerCase() +
+      ':' +
+      JSON.stringify(input.preferences)
+  );
+
+  const cachedResult = PersistentStore_.get('topic_cache', topicCacheKey);
+  if (cachedResult) {
+    return Object.assign({}, cachedResult, {
+      cached: true,
+      telemetry: {
+        geminiCallsUsed: 0,
+        estimatedYoutubeUnitsUsed: 0,
+        cached: true,
+      },
+    });
+  }
+
+  if (payload._onlyIfCached) {
     throw createAppError_(
-      'REQUEST_BUSY',
-      'The service is temporarily busy coordinating requests. Please retry in a moment.'
+      'RATE_LIMITED',
+      'Daily limit reached. Cached videos remain available.'
     );
   }
 
-  if (!hasLock) {
-    throw createAppError_(
-      'REQUEST_BUSY',
-      'The service is currently busy handling other requests. Please wait a moment and try again.'
-    );
-  }
+  enforceYouTubeRateLimit_();
 
-  try {
-    const cache = CacheService.getScriptCache();
-    const minuteBucket = Math.floor(
-      Date.now() / (APP_CONFIG.RATE_LIMIT_WINDOW_SECONDS * 1000)
+  let estimatedYtUnits = 0;
+  let geminiCallsUsed = 0;
+  const prefs = input.preferences;
+  const regionCode = COUNTRY_TO_REGION_CODE[prefs.preferredCountry] || '';
+  const relevanceLanguage = getPrimaryRelevanceLanguage_(prefs.languages);
+
+  // 2. Playlist-First: Look up or fetch full-course playlist for this subject + unit
+  const playlistCacheKey = computeHash_(
+    'pl:' +
+      input.subject.toLowerCase() +
+      ':' +
+      input.unitTitle.toLowerCase() +
+      ':' +
+      (prefs.languages || []).join(',')
+  );
+
+  let candidateVideos = PersistentStore_.get('playlist_cache', playlistCacheKey);
+
+  if (!candidateVideos || !Array.isArray(candidateVideos) || candidateVideos.length === 0) {
+    // Search playlist (100 units)
+    checkYouTubeBudgetBeforeSearchList_();
+    estimatedYtUnits += 100;
+    recordYouTubeUnitCost_(100);
+
+    const playlistQuery = [input.subject, input.unitTitle, 'course', 'lecture']
+      .filter(Boolean)
+      .join(' ');
+
+    const playlists = searchYouTubePlaylistsApi_(
+      {
+        q: playlistQuery,
+        regionCode: regionCode,
+        relevanceLanguage: relevanceLanguage,
+        maxResults: 3,
+      },
+      apiKey
     );
-    const rateKey = 'yt_rate_' + minuteBucket;
-    const currentCount = Number(cache.get(rateKey) || '0');
-    if (currentCount >= APP_CONFIG.MAX_YOUTUBE_REQUESTS_PER_MINUTE) {
-      throw createAppError_(
-        'RATE_LIMITED',
-        'Too many YouTube search requests in a short time. Please wait a minute and retry.'
-      );
-    }
-    cache.put(rateKey, String(currentCount + 1), APP_CONFIG.RATE_LIMIT_WINDOW_SECONDS + 5);
-  } finally {
-    if (hasLock) {
-      try {
-        lock.releaseLock();
-      } catch (releaseErr) {
-        // Ignore lock release failure
+
+    candidateVideos = [];
+    if (playlists.length > 0) {
+      // Fetch playlist items for top playlist (1 unit per 50 items)
+      estimatedYtUnits += 1;
+      recordYouTubeUnitCost_(1);
+      const playlistId = playlists[0].id && playlists[0].id.playlistId ? playlists[0].id.playlistId : '';
+      if (playlistId) {
+        candidateVideos = fetchYouTubePlaylistItemsApi_(playlistId, apiKey);
       }
     }
-  }
-}
 
-function buildTopicOnlyQuery_(input) {
-  let query = input.topicName;
-  if (
-    input.subject &&
-    input.topicName.toLowerCase().indexOf(input.subject.toLowerCase()) === -1 &&
-    input.topicName.split(/\s+/).length <= 4
-  ) {
-    query += ' ' + input.subject;
-  }
-  return query;
-}
-
-function buildYouTubeSearchQuery_(input) {
-  const parts = [input.topicName];
-
-  if (
-    input.subject &&
-    input.topicName.toLowerCase().indexOf(input.subject.toLowerCase()) === -1
-  ) {
-    parts.push(input.subject);
-  }
-
-  parts.push('lecture');
-
-  const langs = input.preferences.languages || [];
-  const hasEnglish = langs.indexOf('English') !== -1;
-  if (!hasEnglish && langs.length > 0) {
-    if (langs.indexOf('Hindi') !== -1) {
-      parts.push('Hindi');
-    } else if (langs.indexOf('Marathi') !== -1) {
-      parts.push('Marathi');
-    } else if (langs.indexOf('Other') !== -1 && input.preferences.otherLanguageLabel) {
-      parts.push(input.preferences.otherLanguageLabel);
+    if (candidateVideos.length > 0) {
+      PersistentStore_.set('playlist_cache', playlistCacheKey, candidateVideos, APP_CONFIG.PERSISTENT_CACHE_TTL_DAYS);
     }
   }
 
-  return parts.join(' ').trim();
-}
+  // 3. Local fuzzy/keyword scoring between topic and candidate videos
+  const matchThreshold =
+    Number(getOptionalScriptProperty_('TOPIC_MATCH_THRESHOLD')) ||
+    APP_CONFIG.DEFAULT_TOPIC_MATCH_THRESHOLD;
 
-function getPrimaryRelevanceLanguage_(languages) {
-  if (!Array.isArray(languages) || languages.length !== 1) return '';
-  if (languages[0] === 'English') return 'en';
-  if (languages[0] === 'Hindi') return 'hi';
-  if (languages[0] === 'Marathi') return 'mr';
-  return '';
-}
+  let matchedCandidates = scoreAndFilterCandidatesForTopic_(
+    input.topicName,
+    input.subtopics,
+    candidateVideos,
+    prefs.videosPerTopic
+  );
 
-function resolvePreferredChannelIds_(preferredChannels, regionCode, apiKey) {
-  const resolved = [];
-  if (!Array.isArray(preferredChannels) || preferredChannels.length === 0) {
-    return resolved;
-  }
+  let queryUsed = input.topicName + ' ' + (input.subject || '');
+  let usedFallbackSearch = false;
 
-  for (let i = 0; i < preferredChannels.length; i++) {
-    const channelName = preferredChannels[i];
-    const chKey = 'yt_ch_' + computeHash_(channelName.toLowerCase());
-    const cached = getCachedJson_(chKey);
-    if (cached) {
-      if (cached.found && cached.channelId) {
-        resolved.push(cached);
-      }
-      continue;
-    }
+  // 4. Fallback to single search.list only when no candidate scores above threshold
+  if (matchedCandidates.length === 0 || matchedCandidates[0].score < matchThreshold) {
+    usedFallbackSearch = true;
+    checkYouTubeBudgetBeforeSearchList_();
+    estimatedYtUnits += 100;
+    recordYouTubeUnitCost_(100);
 
-    const params = {
-      part: 'snippet',
-      type: 'channel',
-      q: channelName,
-      maxResults: '1',
-    };
-    if (regionCode) {
-      params.regionCode = regionCode;
-    }
+    queryUsed = buildYouTubeSearchQuery_(input);
+    const searchItems = searchYouTubeVideosApi_(
+      {
+        q: queryUsed,
+        regionCode: regionCode,
+        relevanceLanguage: relevanceLanguage,
+        maxResults: Math.min(Math.max(prefs.videosPerTopic * 2, 6), 15),
+      },
+      apiKey
+    );
 
-    const data = callYouTubeApiJson_('/search', params, apiKey);
-    const items = Array.isArray(data.items) ? data.items : [];
-    const first = items[0];
-    const channelId =
-      first && first.id && typeof first.id.channelId === 'string'
-        ? first.id.channelId
-        : first && first.snippet && typeof first.snippet.channelId === 'string'
-          ? first.snippet.channelId
-          : '';
-
-    if (channelId) {
-      const entry = {
-        found: true,
-        channelId: channelId,
-        channelTitle:
-          first.snippet && typeof first.snippet.channelTitle === 'string'
-            ? first.snippet.channelTitle
-            : channelName,
+    matchedCandidates = searchItems.map(function (item) {
+      return {
+        videoId: item.id && item.id.videoId ? item.id.videoId : '',
+        title: item.snippet ? item.snippet.title : '',
+        description: item.snippet ? item.snippet.description : '',
+        channelTitle: item.snippet ? item.snippet.channelTitle : '',
+        channelId: item.snippet ? item.snippet.channelId : '',
+        thumbnails: item.snippet ? item.snippet.thumbnails : {},
+        score: 0.6,
       };
-      setCachedJson_(chKey, entry, APP_CONFIG.YOUTUBE_CHANNEL_CACHE_TTL_SECONDS);
-      resolved.push(entry);
-    } else {
-      setCachedJson_(chKey, { found: false }, 3600);
+    }).filter(function (c) {
+      return Boolean(c.videoId);
+    });
+  }
+
+  if (matchedCandidates.length === 0) {
+    const emptyPayload = {
+      topicName: input.topicName,
+      queryUsed: queryUsed,
+      videos: [],
+      cached: false,
+      telemetry: {
+        geminiCallsUsed: geminiCallsUsed,
+        estimatedYoutubeUnitsUsed: estimatedYtUnits,
+        cached: false,
+      },
+    };
+    PersistentStore_.set('topic_cache', topicCacheKey, emptyPayload, APP_CONFIG.PERSISTENT_CACHE_TTL_DAYS);
+    return emptyPayload;
+  }
+
+  // 5. BATCH videos.list (up to 50 IDs in 1 call = 1 unit). Never call per video.
+  const videoIds = matchedCandidates.slice(0, prefs.videosPerTopic * 2).map(function (c) {
+    return c.videoId;
+  });
+
+  estimatedYtUnits += 1;
+  recordYouTubeUnitCost_(1);
+  const videoDetailsMap = fetchYouTubeVideoDetailsMap_(videoIds, apiKey);
+
+  // Collect channels for country detection
+  const channelIds = [];
+  const channelSet = {};
+  for (let i = 0; i < matchedCandidates.length; i++) {
+    const chId = matchedCandidates[i].channelId;
+    if (chId && !channelSet[chId]) {
+      channelSet[chId] = true;
+      channelIds.push(chId);
+    }
+  }
+  const channelCountryMap = fetchYouTubeChannelCountryMap_(channelIds, apiKey);
+
+  // 6. Rank and format final videos
+  const rankedVideos = rankAndFormatYouTubeVideosFromCandidates_(
+    matchedCandidates,
+    videoDetailsMap,
+    channelCountryMap,
+    input
+  );
+
+  const responsePayload = {
+    topicName: input.topicName,
+    queryUsed: queryUsed,
+    videos: rankedVideos,
+    cached: false,
+    telemetry: {
+      geminiCallsUsed: geminiCallsUsed,
+      estimatedYoutubeUnitsUsed: estimatedYtUnits,
+      cached: false,
+    },
+  };
+
+  // 7. Store in 30-day persistent cache
+  PersistentStore_.set('topic_cache', topicCacheKey, responsePayload, APP_CONFIG.PERSISTENT_CACHE_TTL_DAYS);
+
+  return responsePayload;
+}
+
+/**
+ * Handles batch unit search: matches all topics of a unit using 1 playlist fetch,
+ * 1 batch videos.list call, and 1 Gemini call for topic-video relevance mapping.
+ */
+function handleSearchUnitVideos_(payload) {
+  const subject = typeof payload.subject === 'string' ? payload.subject.trim() : '';
+  const unitTitle = typeof payload.unitTitle === 'string' ? payload.unitTitle.trim() : '';
+  const rawTopics = Array.isArray(payload.topics) ? payload.topics : [];
+  const prefs = payload.preferences || {};
+  const apiKey = getYouTubeApiKey_();
+
+  let estimatedYtUnits = 0;
+  let geminiCallsUsed = 0;
+
+  // 1. Fetch playlist for unit (or load from persistent cache)
+  const playlistCacheKey = computeHash_(
+    'pl:' +
+      subject.toLowerCase() +
+      ':' +
+      unitTitle.toLowerCase() +
+      ':' +
+      (prefs.languages || []).join(',')
+  );
+
+  let candidateVideos = PersistentStore_.get('playlist_cache', playlistCacheKey);
+  if (!candidateVideos || candidateVideos.length === 0) {
+    checkYouTubeBudgetBeforeSearchList_();
+    estimatedYtUnits += 100;
+    recordYouTubeUnitCost_(100);
+
+    const query = [subject, unitTitle, 'course', 'lecture'].filter(Boolean).join(' ');
+    const playlists = searchYouTubePlaylistsApi_(
+      {
+        q: query,
+        regionCode: COUNTRY_TO_REGION_CODE[prefs.preferredCountry] || '',
+        relevanceLanguage: getPrimaryRelevanceLanguage_(prefs.languages),
+        maxResults: 3,
+      },
+      apiKey
+    );
+
+    candidateVideos = [];
+    if (playlists.length > 0 && playlists[0].id && playlists[0].id.playlistId) {
+      estimatedYtUnits += 1;
+      recordYouTubeUnitCost_(1);
+      candidateVideos = fetchYouTubePlaylistItemsApi_(playlists[0].id.playlistId, apiKey);
+    }
+    if (candidateVideos.length > 0) {
+      PersistentStore_.set('playlist_cache', playlistCacheKey, candidateVideos, APP_CONFIG.PERSISTENT_CACHE_TTL_DAYS);
     }
   }
 
-  return resolved;
+  // 2. Map unit topics with 1 Gemini call
+  geminiCallsUsed++;
+  const geminiMapping = mapUnitTopicsToVideosWithGemini_(
+    subject,
+    unitTitle,
+    rawTopics,
+    candidateVideos
+  );
+
+  // 3. Batch enrich all mapped video IDs
+  const allVideoIds = [];
+  const seenIds = {};
+  for (const topName in geminiMapping) {
+    const vId = geminiMapping[topName].videoId;
+    if (vId && !seenIds[vId]) {
+      seenIds[vId] = true;
+      allVideoIds.push(vId);
+    }
+  }
+
+  let videoDetailsMap = {};
+  if (allVideoIds.length > 0) {
+    estimatedYtUnits += 1;
+    recordYouTubeUnitCost_(1);
+    videoDetailsMap = fetchYouTubeVideoDetailsMap_(allVideoIds, apiKey);
+  }
+
+  return {
+    unitTitle: unitTitle,
+    topicResults: geminiMapping,
+    videoDetails: videoDetailsMap,
+    telemetry: {
+      geminiCallsUsed: geminiCallsUsed,
+      estimatedYoutubeUnitsUsed: estimatedYtUnits,
+      cached: false,
+    },
+  };
+}
+
+/* ============================================================================
+ * LOCAL CANDIDATE SCORING & FUZZY MATCHING
+ * ========================================================================== */
+
+function scoreAndFilterCandidatesForTopic_(topicName, subtopics, candidateVideos, maxResults) {
+  if (!Array.isArray(candidateVideos) || candidateVideos.length === 0) {
+    return [];
+  }
+
+  const topicTokens = tokenizeAcademicTopic_(topicName);
+  const subtopicTokens = (subtopics || []).map(tokenizeAcademicTopic_).flat();
+  const scored = [];
+
+  for (let i = 0; i < candidateVideos.length; i++) {
+    const cand = candidateVideos[i];
+    const title = cand.title || '';
+    const desc = cand.description || '';
+    const titleTokens = tokenizeAcademicTopic_(title);
+
+    let score = 0;
+    // 1. Token overlap with title
+    let matchCount = 0;
+    for (let t = 0; t < topicTokens.length; t++) {
+      if (titleTokens.indexOf(topicTokens[t]) !== -1) {
+        matchCount++;
+      }
+    }
+
+    if (topicTokens.length > 0) {
+      score += (matchCount / topicTokens.length) * 0.6;
+    }
+
+    // 2. Substring boost
+    if (title.toLowerCase().indexOf(topicName.toLowerCase()) !== -1) {
+      score += 0.35;
+    }
+
+    // 3. Subtopics boost
+    for (let s = 0; s < subtopicTokens.length; s++) {
+      if (titleTokens.indexOf(subtopicTokens[s]) !== -1) {
+        score += 0.1;
+        break;
+      }
+    }
+
+    // 4. Position in playlist bonus (lectures are usually ordered)
+    score += Math.max(0, (50 - i) / 500);
+
+    scored.push({
+      videoId: cand.videoId,
+      title: cand.title,
+      description: cand.description,
+      channelTitle: cand.channelTitle,
+      channelId: cand.channelId,
+      thumbnails: cand.thumbnails,
+      score: score,
+    });
+  }
+
+  scored.sort(function (a, b) {
+    return b.score - a.score;
+  });
+
+  return scored.slice(0, maxResults || 5);
+}
+
+function tokenizeAcademicTopic_(str) {
+  const stopWords = {
+    the: 1, a: 1, an: 1, and: 1, or: 1, of: 1, in: 1, to: 1, for: 1, with: 1,
+    on: 1, at: 1, by: 1, from: 1, introduction: 1, basics: 1, overview: 1,
+    unit: 1, module: 1, chapter: 1, lecture: 1, part: 1, tutorial: 1,
+  };
+  return String(str || '')
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, ' ')
+    .split(/\s+/)
+    .filter(function (word) {
+      return word.length > 2 && !stopWords[word];
+    });
+}
+
+function rankAndFormatYouTubeVideosFromCandidates_(candidates, videoDetailsMap, channelCountryMap, input) {
+  const prefs = input.preferences;
+  const results = [];
+
+  for (let i = 0; i < candidates.length && results.length < prefs.videosPerTopic; i++) {
+    const cand = candidates[i];
+    const details = videoDetailsMap[cand.videoId] || {};
+    const snippet = details.snippet || cand;
+    const contentDetails = details.contentDetails || {};
+    const statistics = details.statistics || {};
+
+    const durationSeconds = parseIso8601DurationSeconds_(contentDetails.duration || '');
+    const durationLabel = formatDurationSeconds_(durationSeconds);
+    const viewCount = parseInt(statistics.viewCount || '0', 10);
+    const viewCountLabel = formatViewCountLabel_(viewCount);
+    const publishedYear = formatPublishedYear_(snippet.publishedAt || '');
+
+    const channelCountry = channelCountryMap[cand.channelId] || '';
+    const audioLang = contentDetails.audioLanguage || snippet.defaultAudioLanguage || '';
+    const inferredLang = inferVideoLanguage_(audioLang, (cand.title + ' ' + cand.description).toLowerCase(), prefs);
+
+    results.push({
+      videoId: cand.videoId,
+      title: decodeHtmlEntities_(cand.title),
+      channelTitle: decodeHtmlEntities_(cand.channelTitle),
+      channelId: cand.channelId,
+      thumbnailUrl:
+        (cand.thumbnails && cand.thumbnails.medium && cand.thumbnails.medium.url) ||
+        (cand.thumbnails && cand.thumbnails.default && cand.thumbnails.default.url) ||
+        ('https://i.ytimg.com/vi/' + cand.videoId + '/mqdefault.jpg'),
+      duration: durationLabel,
+      durationSeconds: durationSeconds,
+      viewCount: viewCount,
+      viewCountLabel: viewCountLabel,
+      publishedYear: publishedYear,
+      inferredLanguage: inferredLang,
+      channelCountryLabel: mapCountryCodeToLabel_(channelCountry),
+      isPreferredChannel: false,
+      relevanceScore: Math.round(cand.score * 100),
+      relevanceExplanation: 'Selected from course playlist for matching "' + input.topicName + '".',
+      coveredSyllabusTerms: [input.topicName],
+      videoSummary: formatConciseVideoSummary_(cand.description, 200),
+    });
+  }
+
+  return results;
+}
+
+/* ============================================================================
+ * YOUTUBE API DIRECT CALLS
+ * ========================================================================== */
+
+function searchYouTubePlaylistsApi_(opts, apiKey) {
+  const params = {
+    part: 'snippet',
+    type: 'playlist',
+    safeSearch: 'moderate',
+    q: opts.q,
+    maxResults: String(opts.maxResults || 3),
+  };
+  if (opts.regionCode) params.regionCode = opts.regionCode;
+  if (opts.relevanceLanguage) params.relevanceLanguage = opts.relevanceLanguage;
+
+  const data = callYouTubeApiJson_('/search', params, apiKey);
+  return Array.isArray(data.items) ? data.items : [];
+}
+
+function fetchYouTubePlaylistItemsApi_(playlistId, apiKey) {
+  const params = {
+    part: 'snippet',
+    playlistId: playlistId,
+    maxResults: '50',
+  };
+  const data = callYouTubeApiJson_('/playlistItems', params, apiKey);
+  const items = Array.isArray(data.items) ? data.items : [];
+
+  return items.map(function (item) {
+    const snip = item.snippet || {};
+    const resId = snip.resourceId || {};
+    return {
+      videoId: resId.videoId || '',
+      title: snip.title || '',
+      description: snip.description || '',
+      channelTitle: snip.channelTitle || '',
+      channelId: snip.channelId || '',
+      thumbnails: snip.thumbnails || {},
+    };
+  }).filter(function (it) {
+    return Boolean(it.videoId);
+  });
 }
 
 function searchYouTubeVideosApi_(opts, apiKey) {
@@ -1533,16 +1732,8 @@ function searchYouTubeVideosApi_(opts, apiKey) {
     q: opts.q,
     maxResults: String(opts.maxResults || 10),
   };
-
-  if (opts.channelId) {
-    params.channelId = opts.channelId;
-  }
-  if (opts.regionCode) {
-    params.regionCode = opts.regionCode;
-  }
-  if (opts.relevanceLanguage) {
-    params.relevanceLanguage = opts.relevanceLanguage;
-  }
+  if (opts.regionCode) params.regionCode = opts.regionCode;
+  if (opts.relevanceLanguage) params.relevanceLanguage = opts.relevanceLanguage;
 
   const data = callYouTubeApiJson_('/search', params, apiKey);
   return Array.isArray(data.items) ? data.items : [];
@@ -1552,6 +1743,7 @@ function fetchYouTubeVideoDetailsMap_(videoIds, apiKey) {
   const detailsMap = {};
   if (!Array.isArray(videoIds) || videoIds.length === 0) return detailsMap;
 
+  // Batch calls in up to 50 IDs per call
   for (let start = 0; start < videoIds.length; start += 50) {
     const batch = videoIds.slice(start, start + 50);
     const data = callYouTubeApiJson_(
@@ -1607,8 +1799,14 @@ function fetchYouTubeChannelCountryMap_(channelIds, apiKey) {
 function callYouTubeApiJson_(path, queryParams, apiKey) {
   const queryParts = [];
   for (const key in queryParams) {
-    if (queryParams.hasOwnProperty(key) && queryParams[key] !== '' && queryParams[key] !== undefined) {
-      queryParts.push(encodeURIComponent(key) + '=' + encodeURIComponent(String(queryParams[key])));
+    if (
+      queryParams.hasOwnProperty(key) &&
+      queryParams[key] !== '' &&
+      queryParams[key] !== undefined
+    ) {
+      queryParts.push(
+        encodeURIComponent(key) + '=' + encodeURIComponent(String(queryParams[key]))
+      );
     }
   }
   const url = APP_CONFIG.YOUTUBE_API_BASE + path + '?' + queryParts.join('&');
@@ -1643,19 +1841,14 @@ function callYouTubeApiJson_(path, queryParams, apiKey) {
     try {
       return JSON.parse(bodyText);
     } catch (e) {
-      throw createAppError_(
-        'YOUTUBE_INVALID_RESPONSE',
-        'YouTube API returned malformed JSON.'
-      );
+      throw createAppError_('YOUTUBE_INVALID_RESPONSE', 'YouTube API returned malformed JSON.');
     }
   }
 
   let parsedErr = null;
   try {
     parsedErr = JSON.parse(bodyText);
-  } catch (e) {
-    parsedErr = null;
-  }
+  } catch (e) {}
 
   const errReason =
     parsedErr &&
@@ -1678,8 +1871,8 @@ function callYouTubeApiJson_(path, queryParams, apiKey) {
     errReason === 'rateLimitExceeded'
   ) {
     throw createAppError_(
-      'YOUTUBE_QUOTA_EXCEEDED',
-      'YouTube Data API daily quota or rate limit exceeded. Please try again later.'
+      'QUOTA_EXCEEDED',
+      'YouTube Data API daily quota limit exceeded. Live video searches paused until 00:00 UTC.'
     );
   }
 
@@ -1690,7 +1883,7 @@ function callYouTubeApiJson_(path, queryParams, apiKey) {
   ) {
     throw createAppError_(
       'YOUTUBE_AUTH_ERROR',
-      'YouTube Data API authentication failed. Verify YOUTUBE_API_KEY in Script Properties and ensure YouTube Data API v3 is enabled in your Google Cloud project.'
+      'YouTube Data API authentication failed. Verify YOUTUBE_API_KEY in Script Properties.'
     );
   }
 
@@ -1701,465 +1894,269 @@ function callYouTubeApiJson_(path, queryParams, apiKey) {
     );
   }
 
-  throw createAppError_('YOUTUBE_API_ERROR', sanitizeErrorMessage_(rawMsg, apiKey));
+  throw createAppError_('YOUTUBE_ERROR', sanitizeErrorMessage_(rawMsg, apiKey));
 }
 
-function rankAndFormatYouTubeVideos_(
-  rawSearchItems,
-  videoDetailsMap,
-  channelCountryMap,
-  input
-) {
-  const prefs = input.preferences;
-  const normalizedPreferred = prefs.preferredChannels.map(function (c) {
-    return c.toLowerCase();
+function handleSearchYouTubeVideos_(payload) {
+  // Legacy backward-compatibility endpoint
+  const topicName = typeof payload.topicName === 'string' ? payload.topicName.trim() : '';
+  if (!topicName) {
+    throw createAppError_('MISSING_TOPIC_NAME', 'Missing topicName for search.');
+  }
+  return handleSearchTopicVideos_({
+    topicName: topicName,
+    subject: payload.subject || '',
+    preferences: payload.preferences || {},
   });
-  const selectedLangsLower = prefs.languages.map(function (l) {
-    return l.toLowerCase();
-  });
-  const targetRegionCode = COUNTRY_TO_REGION_CODE[prefs.preferredCountry] || '';
-  const topicWords = input.topicName
-    .toLowerCase()
-    .split(/[^a-z0-9]+/)
-    .filter(function (w) {
-      return w.length >= 3;
-    });
+}
 
-  const primaryMatches = [];
-  const fallbackMatches = [];
+/* ============================================================================
+ * CONCURRENCY, RATE LIMITING & SUBMISSION GUARDS
+ * ========================================================================== */
 
-  for (let i = 0; i < rawSearchItems.length; i++) {
-    const item = rawSearchItems[i];
-    const videoId = item.id.videoId;
-    const detail = videoDetailsMap[videoId] || null;
-    const snippet = (detail && detail.snippet) || item.snippet || {};
+function acquireSubmissionGuard_(action, syllabusText) {
+  const lock = LockService.getScriptLock();
+  let hasLock = false;
 
-    const title = decodeHtmlEntities_(String(snippet.title || 'Untitled Lecture'));
-    const description = decodeHtmlEntities_(String(snippet.description || ''));
-    const channelId = String(snippet.channelId || '');
-    const channelName = decodeHtmlEntities_(
-      String(snippet.channelTitle || 'YouTube Educator')
+  try {
+    hasLock = lock.tryLock(APP_CONFIG.LOCK_WAIT_MS);
+  } catch (lockErr) {
+    hasLock = false;
+  }
+
+  if (!hasLock) {
+    throw createAppError_(
+      'SERVER_BUSY',
+      'The server is currently processing concurrent requests. Please retry in a few moments.'
     );
+  }
 
-    const isoDuration =
-      detail && detail.contentDetails && typeof detail.contentDetails.duration === 'string'
-        ? detail.contentDetails.duration
-        : '';
-    const durationSeconds = parseIso8601DurationSeconds_(isoDuration);
+  try {
+    const requestHash = computeSha256_(action + ':' + syllabusText);
+    const props = PropertiesService.getScriptProperties();
+    const cache = CacheService.getScriptCache();
+    const now = Math.floor(Date.now() / 1000);
 
-    // Skip YouTube Shorts (< 60s) unless we have nothing else
-    const isVeryShortClip = durationSeconds > 0 && durationSeconds < 60;
+    const inflightKey = 'inflight_' + requestHash;
+    const cooldownKey = 'cd_' + requestHash;
 
-    const viewCount =
-      detail && detail.statistics && detail.statistics.viewCount
-        ? Number(detail.statistics.viewCount)
-        : 0;
-
-    const channelCountry = channelCountryMap[channelId] || '';
-    const audioLangRaw = String(
-      (detail &&
-        detail.snippet &&
-        (detail.snippet.defaultAudioLanguage || detail.snippet.defaultLanguage)) ||
-        ''
-    ).toLowerCase();
-
-    const detectedLanguage = inferVideoLanguage_(
-      audioLangRaw,
-      title + ' ' + description,
-      prefs
-    );
-
-    const channelLower = channelName.toLowerCase();
-    const titleLower = title.toLowerCase();
-    const combinedLower = titleLower + ' ' + description.toLowerCase() + ' ' + channelLower;
-
-    const isPreferredChannel = normalizedPreferred.some(function (pref) {
-      return channelLower.indexOf(pref) !== -1 || pref.indexOf(channelLower) !== -1;
-    });
-
-    const isIndianEducator =
-      channelCountry === 'IN' ||
-      audioLangRaw.indexOf('hi') === 0 ||
-      audioLangRaw.indexOf('mr') === 0 ||
-      KNOWN_INDIAN_EDUCATOR_PATTERNS.some(function (pattern) {
-        return combinedLower.indexOf(pattern) !== -1;
-      });
-
-    const matchesLanguage =
-      selectedLangsLower.length === 0 ||
-      selectedLangsLower.indexOf(detectedLanguage.toLowerCase()) !== -1 ||
-      (selectedLangsLower.indexOf('other') !== -1 &&
-        prefs.otherLanguageLabel &&
-        combinedLower.indexOf(prefs.otherLanguageLabel.toLowerCase()) !== -1);
-
-    const matchesCountry =
-      !targetRegionCode ||
-      channelCountry === targetRegionCode ||
-      (targetRegionCode === 'IN' && isIndianEducator);
-
-    let score = 50;
-    const reasons = [];
-
-    if (isPreferredChannel) {
-      score += 120;
-      reasons.push('Preferred Channel');
+    if (cache.get(inflightKey)) {
+      throw createAppError_(
+        'DUPLICATE_IN_FLIGHT',
+        'An identical syllabus analysis request is already processing. Please wait for it to complete.'
+      );
     }
 
-    if (prefs.prioritizeIndianChannels && isIndianEducator) {
-      score += 45;
-      reasons.push('Indian Educator Priority');
+    if (cache.get(cooldownKey)) {
+      throw createAppError_(
+        'DUPLICATE_SUBMISSION',
+        'An identical syllabus was submitted recently. Please wait before re-submitting.'
+      );
     }
 
-    if (matchesCountry && targetRegionCode) {
-      score += 20;
+    // Per-minute sliding window check
+    const minuteWindow = Math.floor(now / APP_CONFIG.RATE_LIMIT_WINDOW_SECONDS);
+    const rateLimitKey = 'rl_minute_' + minuteWindow;
+    const currentCountStr = props.getProperty(rateLimitKey);
+    const currentCount = currentCountStr ? parseInt(currentCountStr, 10) : 0;
+
+    if (currentCount >= APP_CONFIG.MAX_REQUESTS_PER_MINUTE) {
+      throw createAppError_(
+        'RATE_LIMITED',
+        'Global server request limit reached (' +
+          APP_CONFIG.MAX_REQUESTS_PER_MINUTE +
+          ' requests/min). Please retry shortly.'
+      );
     }
 
-    if (matchesLanguage && selectedLangsLower.length > 0) {
-      score += 30;
-    }
+    props.setProperty(rateLimitKey, String(currentCount + 1));
+    cache.put(inflightKey, String(now), APP_CONFIG.INFLIGHT_LOCK_SECONDS);
 
-    let topicHits = 0;
-    for (let w = 0; w < topicWords.length; w++) {
-      if (titleLower.indexOf(topicWords[w]) !== -1) {
-        topicHits += 1;
-      }
-    }
-    if (topicWords.length > 0) {
-      score += Math.round((topicHits / topicWords.length) * 25);
-    }
-
-    if (viewCount > 0) {
-      score += Math.min(15, Math.log10(viewCount + 1) * 2);
-    }
-
-    if (isVeryShortClip) {
-      score -= 40;
-    }
-
-    const thumbnails = snippet.thumbnails || {};
-    const thumbObj = thumbnails.high || thumbnails.medium || thumbnails.default || {};
-    const thumbnailUrl =
-      typeof thumbObj.url === 'string' && thumbObj.url
-        ? thumbObj.url
-        : 'https://i.ytimg.com/vi/' + videoId + '/hqdefault.jpg';
-
-    const countryOrigin = mapCountryCodeToLabel_(
-      channelCountry || (isIndianEducator ? 'IN' : '')
-    );
-
-    const coverage = detectCoveredSyllabusTerms_(
-      input.topicName,
-      input.subtopics,
-      title,
-      description
-    );
-
-    const strictMatch =
-      prefs.preferredChannels.length > 0
-        ? isPreferredChannel && matchesLanguage
-        : matchesLanguage && matchesCountry;
-
-    const isFallbackResult = !(strictMatch && !isVeryShortClip);
-    const relevanceExplanation = buildRelevanceExplanation_({
-      titleHits: topicHits,
-      totalTopicWords: topicWords.length,
-      coveredCount: coverage.coveredTopics.length,
-      isPreferredChannel: isPreferredChannel,
-      isIndianEducator: prefs.prioritizeIndianChannels && isIndianEducator,
-      matchesLanguage: matchesLanguage && selectedLangsLower.length > 0,
-      language: detectedLanguage,
-      matchesCountry: matchesCountry && Boolean(targetRegionCode),
-      countryOrigin: countryOrigin,
-      isFallback: isFallbackResult,
-    });
-
-    const videoObj = {
-      id: videoId,
-      videoId: videoId,
-      title: title,
-      channelId: channelId,
-      channelName: channelName,
-      channelCountry: channelCountry,
-      countryOrigin: countryOrigin,
-      isIndianEducator: isIndianEducator,
-      language: detectedLanguage,
-      duration: formatDurationSeconds_(durationSeconds),
-      viewsLabel: formatViewCountLabel_(viewCount),
-      publishedLabel: formatPublishedYear_(snippet.publishedAt),
-      thumbnailUrl: thumbnailUrl,
-      summary: formatConciseVideoSummary_(description, 380),
-      coveredTopics: coverage.coveredTopics,
-      relevanceExplanation: relevanceExplanation,
-      youtubeSearchQuery: buildTopicOnlyQuery_(input) + ' ' + channelName,
-      videoUrl: 'https://www.youtube.com/watch?v=' + videoId,
-      relevanceScore: Math.round(score),
-      rankReason: reasons.length > 0 ? reasons.join(' · ') : null,
-      isFallback: isFallbackResult,
+    return {
+      lock: lock,
+      inflightKey: inflightKey,
+      cooldownKey: cooldownKey,
     };
-
-    if (!isFallbackResult) {
-      primaryMatches.push({ score: score, video: videoObj });
-    } else {
-      const fallbackReasons = reasons.slice();
-      fallbackReasons.push('Fallback Result');
-      videoObj.rankReason = fallbackReasons.join(' · ');
-      fallbackMatches.push({ score: score, video: videoObj });
-    }
+  } catch (err) {
+    try {
+      lock.releaseLock();
+    } catch (e) {}
+    throw err;
   }
-
-  primaryMatches.sort(function (a, b) {
-    return b.score - a.score;
-  });
-  fallbackMatches.sort(function (a, b) {
-    return b.score - a.score;
-  });
-
-  const combined = prefs.allowFallbackChannels
-    ? primaryMatches.concat(fallbackMatches)
-    : primaryMatches;
-
-  const sliced = [];
-  for (let i = 0; i < combined.length && i < prefs.videosPerTopic; i++) {
-    sliced.push(combined[i].video);
-  }
-  return sliced;
 }
 
-function detectCoveredSyllabusTerms_(topicName, subtopics, title, description) {
-  const metadataText = (String(title || '') + ' ' + String(description || '')).toLowerCase();
-  const stopWords = {
-    and: true,
-    the: true,
-    for: true,
-    with: true,
-    from: true,
-    into: true,
-    using: true,
-    based: true,
-    introduction: true,
-    basics: true,
-    overview: true,
-    concept: true,
-    concepts: true,
-    types: true,
-    unit: true,
-    chapter: true,
-    topic: true,
-    part: true,
-    lecture: true,
-  };
-
-  const candidates = [];
-  if (typeof topicName === 'string' && topicName.trim()) {
-    candidates.push(topicName.trim());
-  }
-  if (Array.isArray(subtopics)) {
-    for (let i = 0; i < subtopics.length; i++) {
-      if (typeof subtopics[i] === 'string' && subtopics[i].trim()) {
-        candidates.push(subtopics[i].trim());
-      }
+function releaseSubmissionGuard_(guard, markCooldown) {
+  if (!guard) return;
+  try {
+    const cache = CacheService.getScriptCache();
+    if (guard.inflightKey) {
+      cache.remove(guard.inflightKey);
     }
-  }
-
-  const coveredTopics = [];
-  const seen = {};
-
-  for (let i = 0; i < candidates.length; i++) {
-    const label = candidates[i];
-    const lowerLabel = label.toLowerCase();
-    if (seen[lowerLabel]) continue;
-
-    let matched = false;
-    if (metadataText.indexOf(lowerLabel) !== -1) {
-      matched = true;
-    } else {
-      const words = lowerLabel
-        .split(/[^a-z0-9]+/)
-        .filter(function (w) {
-          return w.length >= 3 && !stopWords[w];
-        });
-      if (words.length > 0) {
-        let hits = 0;
-        for (let w = 0; w < words.length; w++) {
-          if (metadataText.indexOf(words[w]) !== -1) {
-            hits += 1;
-          }
-        }
-        const threshold = words.length === 1 ? 1 : Math.ceil(words.length * 0.6);
-        if (hits >= threshold) {
-          matched = true;
-        }
-      }
+    if (markCooldown && guard.cooldownKey) {
+      cache.put(
+        guard.cooldownKey,
+        String(Math.floor(Date.now() / 1000)),
+        APP_CONFIG.DUPLICATE_COOLDOWN_SECONDS
+      );
     }
+  } catch (e) {}
 
-    if (matched) {
-      seen[lowerLabel] = true;
-      coveredTopics.push(label);
+  try {
+    if (guard.lock) {
+      guard.lock.releaseLock();
     }
-  }
-
-  return { coveredTopics: coveredTopics };
+  } catch (e) {}
 }
 
-function buildRelevanceExplanation_(ctx) {
-  const notes = [];
-  if (ctx.isPreferredChannel) {
-    notes.push('Matches your preferred channel');
+function enforceYouTubeRateLimit_() {
+  const lock = LockService.getScriptLock();
+  let hasLock = false;
+
+  try {
+    hasLock = lock.tryLock(APP_CONFIG.LOCK_WAIT_MS);
+  } catch (e) {}
+
+  if (!hasLock) return;
+
+  try {
+    const props = PropertiesService.getScriptProperties();
+    const now = Math.floor(Date.now() / 1000);
+    const windowKey = 'yt_rl_' + Math.floor(now / APP_CONFIG.RATE_LIMIT_WINDOW_SECONDS);
+    const raw = props.getProperty(windowKey);
+    const count = raw ? parseInt(raw, 10) : 0;
+
+    if (count >= APP_CONFIG.MAX_YOUTUBE_REQUESTS_PER_MINUTE) {
+      throw createAppError_(
+        'RATE_LIMITED',
+        'YouTube search burst rate limit reached. Please wait a minute and retry.'
+      );
+    }
+
+    props.setProperty(windowKey, String(count + 1));
+  } finally {
+    try {
+      lock.releaseLock();
+    } catch (e) {}
   }
-  if (ctx.titleHits > 0 && ctx.totalTopicWords > 0) {
-    if (ctx.titleHits >= ctx.totalTopicWords) {
-      notes.push('Video title matches all key topic terms');
-    } else {
-      notes.push('Video title contains syllabus topic keywords');
+}
+
+/* ============================================================================
+ * FORMATTING HELPERS
+ * ========================================================================== */
+
+function buildYouTubeSearchQuery_(input) {
+  const parts = [input.topicName];
+  if (
+    input.subject &&
+    input.topicName.toLowerCase().indexOf(input.subject.toLowerCase()) === -1
+  ) {
+    parts.push(input.subject);
+  }
+  parts.push('lecture');
+
+  const langs = input.preferences.languages || [];
+  if (langs.indexOf('English') === -1 && langs.length > 0) {
+    if (langs.indexOf('Hindi') !== -1) parts.push('Hindi');
+    else if (langs.indexOf('Marathi') !== -1) parts.push('Marathi');
+    else if (langs.indexOf('Other') !== -1 && input.preferences.otherLanguageLabel) {
+      parts.push(input.preferences.otherLanguageLabel);
     }
   }
-  if (ctx.coveredCount > 0) {
-    notes.push(
-      'Metadata aligns with ' +
-        ctx.coveredCount +
-        ' syllabus ' +
-        (ctx.coveredCount === 1 ? 'term' : 'terms')
-    );
-  }
-  if (ctx.isIndianEducator) {
-    notes.push('Prioritised Indian educator channel');
-  }
-  if (ctx.matchesLanguage && ctx.language) {
-    notes.push('Matches ' + ctx.language + ' language preference');
-  }
-  if (ctx.matchesCountry && ctx.countryOrigin) {
-    notes.push('Aligned with ' + ctx.countryOrigin + ' region');
-  }
-  if (ctx.isFallback) {
-    notes.push('Included as a fallback option beyond strict filters');
-  }
-  if (notes.length === 0) {
-    notes.push('Returned by YouTube search for this syllabus topic');
-  }
-  return notes.slice(0, 3).join(' · ');
+  return parts.join(' ').trim();
+}
+
+function getPrimaryRelevanceLanguage_(languages) {
+  if (!Array.isArray(languages) || languages.length !== 1) return '';
+  if (languages[0] === 'English') return 'en';
+  if (languages[0] === 'Hindi') return 'hi';
+  if (languages[0] === 'Marathi') return 'mr';
+  return '';
 }
 
 function formatConciseVideoSummary_(rawDescription, maxChars) {
   if (!rawDescription || typeof rawDescription !== 'string') return '';
-  const cleanedLines = rawDescription
+  const cleaned = rawDescription
     .split(/\r?\n/)
     .map(function (line) {
-      return line.replace(/https?:\/\/\S+/gi, '').trim();
+      return line.trim();
     })
     .filter(function (line) {
-      return line.length >= 12 && !/^(subscribe|follow us|like|share|join)\b/i.test(line);
-    });
+      return (
+        line.length > 0 &&
+        !/^https?:\/\//i.test(line) &&
+        !/follow us|subscribe|telegram|instagram|facebook|twitter|discord/i.test(line)
+      );
+    })
+    .join(' ');
 
-  const combined = cleanedLines.join(' ').replace(/\s+/g, ' ').trim();
-  if (!combined) return '';
-  if (combined.length <= maxChars) return combined;
-
-  const sentences = combined.match(/[^.!?]+[.!?]+/g) || [];
-  let excerpt = '';
-  for (let i = 0; i < sentences.length && i < 4; i++) {
-    const candidate = (excerpt ? excerpt + ' ' : '') + sentences[i].trim();
-    if (candidate.length > maxChars) break;
-    excerpt = candidate;
-  }
-
-  if (excerpt) return excerpt;
-  return combined.slice(0, maxChars - 1).trim() + '…';
+  const limit = maxChars || 200;
+  return cleaned.length <= limit ? cleaned : cleaned.slice(0, limit) + '...';
 }
 
 function inferVideoLanguage_(audioLangCode, textLower, prefs) {
-  if (audioLangCode.indexOf('hi') === 0) return 'Hindi';
-  if (audioLangCode.indexOf('mr') === 0) return 'Marathi';
-  if (audioLangCode.indexOf('en') === 0) return 'English';
-
-  const lower = textLower.toLowerCase();
-  if (lower.indexOf('marathi') !== -1) return 'Marathi';
-  if (
-    lower.indexOf('hindi') !== -1 ||
-    lower.indexOf('hinglish') !== -1 ||
-    /[\u0900-\u097F]/.test(textLower)
-  ) {
-    return 'Hindi';
+  if (audioLangCode) {
+    const code = audioLangCode.toLowerCase();
+    if (code.indexOf('hi') === 0) return 'Hindi';
+    if (code.indexOf('en') === 0) return 'English';
+    if (code.indexOf('mr') === 0) return 'Marathi';
   }
-  if (
-    prefs &&
-    prefs.otherLanguageLabel &&
-    lower.indexOf(prefs.otherLanguageLabel.toLowerCase()) !== -1
-  ) {
-    return 'Other';
-  }
+  if (/\b(hindi|bilingual|hinglish)\b/.test(textLower)) return 'Hindi';
+  if (/\b(marathi)\b/.test(textLower)) return 'Marathi';
   return 'English';
 }
 
 function mapCountryCodeToLabel_(code) {
+  if (!code) return '';
   if (code === 'IN') return 'India';
   if (code === 'US') return 'United States';
   if (code === 'GB') return 'United Kingdom';
-  return code || 'Global';
+  return code;
 }
 
 function parseIso8601DurationSeconds_(iso) {
-  if (!iso) return 0;
-  const match = /^PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?$/i.exec(iso);
+  if (!iso || typeof iso !== 'string') return 0;
+  const match = iso.match(/PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?/);
   if (!match) return 0;
-  const hours = Number(match[1] || 0);
-  const mins = Number(match[2] || 0);
-  const secs = Number(match[3] || 0);
-  return hours * 3600 + mins * 60 + secs;
+  const hours = parseInt(match[1] || '0', 10);
+  const minutes = parseInt(match[2] || '0', 10);
+  const seconds = parseInt(match[3] || '0', 10);
+  return hours * 3600 + minutes * 60 + seconds;
 }
 
 function formatDurationSeconds_(totalSeconds) {
-  if (!totalSeconds || totalSeconds <= 0) return '';
-  const hrs = Math.floor(totalSeconds / 3600);
-  const mins = Math.floor((totalSeconds % 3600) / 60);
-  const secs = totalSeconds % 60;
+  if (!totalSeconds || totalSeconds <= 0) return '0:00';
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = totalSeconds % 60;
   const pad = function (n) {
     return n < 10 ? '0' + n : String(n);
   };
-  if (hrs > 0) {
-    return hrs + ':' + pad(mins) + ':' + pad(secs);
-  }
-  return mins + ':' + pad(secs);
+  return hours > 0
+    ? hours + ':' + pad(minutes) + ':' + pad(seconds)
+    : minutes + ':' + pad(seconds);
 }
 
 function formatViewCountLabel_(views) {
-  if (!views || !isFinite(views) || views <= 0) return 'YouTube';
-  if (views >= 1000000) {
-    return (views / 1000000).toFixed(1).replace(/\.0$/, '') + 'M views';
-  }
-  if (views >= 1000) {
-    return Math.round(views / 1000) + 'K views';
-  }
+  if (!views || views <= 0) return '0 views';
+  if (views >= 1000000) return (views / 1000000).toFixed(1) + 'M views';
+  if (views >= 1000) return (views / 1000).toFixed(1) + 'K views';
   return views + ' views';
 }
 
 function formatPublishedYear_(isoDate) {
-  if (typeof isoDate !== 'string' || isoDate.length < 4) return 'YouTube';
-  return isoDate.slice(0, 4);
+  if (!isoDate || typeof isoDate !== 'string') return '';
+  const match = isoDate.match(/^(\d{4})/);
+  return match ? match[1] : '';
 }
 
 function decodeHtmlEntities_(str) {
+  if (!str || typeof str !== 'string') return '';
   return str
     .replace(/&amp;/g, '&')
-    .replace(/&lt;/g, '<')
-    .replace(/&gt;/g, '>')
     .replace(/&quot;/g, '"')
     .replace(/&#39;/g, "'")
-    .replace(/&#x27;/g, "'");
-}
-
-function computeHash_(inputStr) {
-  const digestBytes = Utilities.computeDigest(
-    Utilities.DigestAlgorithm.SHA_256,
-    inputStr,
-    Utilities.Charset.UTF_8
-  );
-  let hex = '';
-  for (let i = 0; i < digestBytes.length; i++) {
-    const byteVal = (digestBytes[i] + 256) % 256;
-    const hexPart = byteVal.toString(16);
-    hex += hexPart.length === 1 ? '0' + hexPart : hexPart;
-  }
-  return hex;
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>');
 }
 
 function getCachedJson_(key) {
@@ -2178,13 +2175,11 @@ function setCachedJson_(key, obj, ttlSeconds) {
     if (serialized.length < 95000) {
       CacheService.getScriptCache().put(key, serialized, ttlSeconds);
     }
-  } catch (e) {
-    // Ignore CacheService size/storage failures
-  }
+  } catch (e) {}
 }
 
 /* ============================================================================
- * SCRIPT PROPERTIES & SHARED HELPERS
+ * SCRIPT PROPERTIES & ERROR SANITIZATION
  * ========================================================================== */
 
 function getRequiredScriptSecret_(propertyName) {
@@ -2236,9 +2231,7 @@ function extractUpstreamGeminiError_(responseBodyText, upstreamStatus, apiKey) {
       if (parsed && parsed.error && typeof parsed.error.message === 'string') {
         return sanitizeErrorMessage_(parsed.error.message.trim(), apiKey);
       }
-    } catch (e) {
-      // Ignore non-JSON error body
-    }
+    } catch (e) {}
   }
   return 'Gemini API request failed with HTTP status ' + upstreamStatus + '.';
 }
@@ -2248,7 +2241,6 @@ function sanitizeErrorMessage_(message, apiKey) {
   if (apiKey) {
     clean = clean.split(apiKey).join('[REDACTED]');
   }
-  // Redact any Google API key pattern if ever echoed by upstream messages
   clean = clean.replace(/AIza[0-9A-Za-z_-]{20,}/g, '[REDACTED]');
   return clean;
 }
@@ -2283,7 +2275,6 @@ function errorOutput_(err) {
     console.error('Unhandled Apps Script error:', err);
   }
 
-  // Apps Script ContentService always returns HTTP 200 OK; clients must check `ok`.
   return jsonOutput_({
     ok: false,
     error: {
