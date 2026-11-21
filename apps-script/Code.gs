@@ -23,7 +23,7 @@
 const APP_CONFIG = {
   SERVICE_NAME: 'SyllabusTube Apps Script Backend',
   DEFAULT_GEMINI_MODEL: 'gemini-1.5-flash',
-  DEFAULT_GEMINI_FALLBACK_MODEL: 'gemini-1.5-flash-8b',
+  DEFAULT_GEMINI_FALLBACK_MODEL: 'gemini-2.5-flash',
   MAX_CHARS_PER_CALL: 25000,
   DEFAULT_YOUTUBE_DAILY_BUDGET: 10000,
   YOUTUBE_BUDGET_CUTOFF_RATIO: 0.90, // Cut off search.list at 90% (9,000 units)
@@ -39,11 +39,11 @@ const APP_CONFIG = {
   MAX_RETRY_ATTEMPTS: 3,
   RETRY_BASE_DELAY_MS: 800,
   LOCK_WAIT_MS: 3000,
-  DUPLICATE_COOLDOWN_SECONDS: 15,
+  DUPLICATE_COOLDOWN_SECONDS: 2,
   INFLIGHT_LOCK_SECONDS: 60,
   RATE_LIMIT_WINDOW_SECONDS: 60,
-  MAX_REQUESTS_PER_MINUTE: 15,
-  MAX_YOUTUBE_REQUESTS_PER_MINUTE: 60,
+  MAX_REQUESTS_PER_MINUTE: 120,
+  MAX_YOUTUBE_REQUESTS_PER_MINUTE: 120,
   YOUTUBE_CACHE_TTL_SECONDS: 21600, // 6h in CacheService
   YOUTUBE_CHANNEL_CACHE_TTL_SECONDS: 86400,
   MAX_PREFERRED_CHANNELS: 5,
@@ -661,19 +661,21 @@ function getCandidateGeminiModels_() {
   const pool = [
     customModel,
     customFallback,
-    APP_CONFIG.DEFAULT_GEMINI_MODEL,
     'gemini-1.5-flash',
-    'gemini-1.5-flash-latest',
     'gemini-2.5-flash',
+    'gemini-1.5-flash-latest',
     'gemini-2.5-flash-lite',
-    'gemini-1.5-flash-8b',
   ];
 
   const unique = [];
+  const invalidModels = {
+    'gemini-2.0-flash': true,
+    'gemini-1.5-flash-8b': true,
+  };
+
   for (let i = 0; i < pool.length; i++) {
     const m = typeof pool[i] === 'string' ? pool[i].trim() : '';
-    // Skip deprecated models known to fail
-    if (m && m !== 'gemini-2.0-flash' && unique.indexOf(m) === -1) {
+    if (m && !invalidModels[m] && unique.indexOf(m) === -1) {
       unique.push(m);
     }
   }
@@ -909,6 +911,13 @@ function callGeminiWithRetry_(model, apiKey, requestBody) {
       'QUOTA_EXCEEDED',
       'Gemini API quota or rate limit exceeded. Please wait a few seconds and retry.'
     );
+  }
+
+  if (
+    lastUpstreamStatus === 404 ||
+    /not found|is not found|unsupported|no longer available/i.test(lastErrorMessage)
+  ) {
+    throw createAppError_('GEMINI_MODEL_NOT_FOUND', lastErrorMessage);
   }
 
   if (

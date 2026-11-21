@@ -7,8 +7,8 @@ const RATE_LIMIT_WINDOW_MS = 60 * 1000; // 1 minute
 const MAX_REQUESTS_PER_WINDOW = 60;
 const MAX_BODY_SIZE_BYTES = 2 * 1024 * 1024; // 2 MB
 
-const DEFAULT_GLOBAL_DAILY_CAP = 10;
-const DEFAULT_IP_DAILY_CAP = 3;
+const DEFAULT_GLOBAL_DAILY_CAP = 50;
+const DEFAULT_IP_DAILY_CAP = 25;
 
 function getTodayUtcKey() {
   return new Date().toISOString().slice(0, 10);

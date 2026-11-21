@@ -357,7 +357,7 @@ export function HeroUploader({
               type="button"
               onClick={onSubmit}
               disabled={isProcessing || isExtracting}
-              className="inline-flex items-center gap-1.5 rounded-md bg-blue-600 dark:bg-blue-600 px-4 py-2 text-xs font-semibold text-white hover:bg-blue-700 dark:hover:bg-blue-500 disabled:opacity-50 transition-colors cursor-pointer focus-visible:outline-none shadow-sm"
+              className="inline-flex items-center gap-1.5 rounded-md bg-zinc-900 text-white hover:bg-black dark:bg-white dark:text-zinc-900 dark:hover:bg-zinc-100 disabled:opacity-50 px-4 py-2 text-xs font-semibold transition-colors cursor-pointer focus-visible:outline-none shadow-sm"
             >
               <span>{isProcessing ? 'Structuring...' : 'Generate Roadmap'}</span>
               <ArrowRight className="h-3.5 w-3.5" strokeWidth={1.75} />

@@ -449,10 +449,6 @@ export default function App() {
           overallProgress={overallProgress}
           onResetSyllabus={handleResetSyllabus}
           onPrint={() => window.print()}
-          onOpenAuth={() => {
-            setAuthModalReason(null);
-            setIsAuthModalOpen(true);
-          }}
         />
 
         {/* Transient Dismissible Banner */}

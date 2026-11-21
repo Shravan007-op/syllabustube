@@ -1,7 +1,6 @@
 import { useEffect, useState } from 'react';
-import { LogIn, LogOut, Moon, Printer, RotateCcw, Sun, User as UserIcon } from 'lucide-react';
+import { Moon, Printer, RotateCcw, Sun } from 'lucide-react';
 import { APP_CONFIG } from '../config';
-import { useAuth } from '../contexts/AuthContext';
 
 interface NavbarProps {
   subjectName?: string;
@@ -13,7 +12,6 @@ interface NavbarProps {
   } | null;
   onResetSyllabus?: () => void;
   onPrint?: () => void;
-  onOpenAuth?: () => void;
 }
 
 export function Navbar({
@@ -22,9 +20,7 @@ export function Navbar({
   overallProgress,
   onResetSyllabus,
   onPrint,
-  onOpenAuth,
 }: NavbarProps) {
-  const { user, signOut } = useAuth();
   const [isDark, setIsDark] = useState<boolean>(() => {
     if (typeof window === 'undefined') return false;
     return document.documentElement.classList.contains('dark');
@@ -153,39 +149,6 @@ export function Navbar({
               <Moon className="h-4 w-4 text-slate-700" strokeWidth={1.75} />
             )}
           </button>
-
-          {/* Authentication Action */}
-          {user ? (
-            <div className="flex items-center gap-1.5 pl-1 border-l border-border-subtle">
-              <span className="hidden lg:inline-flex items-center gap-1 text-xs text-text-muted max-w-[140px] truncate" title={user.email || ''}>
-                <UserIcon className="h-3.5 w-3.5 shrink-0" />
-                <span className="truncate">{user.email?.split('@')[0]}</span>
-              </span>
-              <button
-                type="button"
-                onClick={() => signOut()}
-                aria-label="Log out of account"
-                title="Log out"
-                className="inline-flex h-8 items-center gap-1.5 rounded-md border border-border-subtle bg-surface px-2.5 text-xs font-medium text-text-muted hover:border-border-strong hover:text-text-main transition-colors cursor-pointer"
-              >
-                <LogOut className="h-3.5 w-3.5" strokeWidth={1.75} />
-                <span className="hidden sm:inline">Log out</span>
-              </button>
-            </div>
-          ) : (
-            <div className="pl-1 border-l border-border-subtle">
-              <button
-                type="button"
-                onClick={onOpenAuth}
-                aria-label="Sign in to SyllabusTube"
-                title="Sign in"
-                className="inline-flex h-8 items-center gap-1.5 rounded-md bg-accent px-3 text-xs font-medium text-white hover:bg-accent-hover transition-colors cursor-pointer shadow-xs"
-              >
-                <LogIn className="h-3.5 w-3.5" strokeWidth={1.75} />
-                <span>Sign in</span>
-              </button>
-            </div>
-          )}
         </div>
       </div>
     </header>
