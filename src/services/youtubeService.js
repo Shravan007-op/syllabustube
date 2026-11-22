@@ -1,18 +1,14 @@
 import {
   AppsScriptServiceError,
-  getAppsScriptEndpointUrl,
   isAppsScriptConfigured,
   postToBackend,
 } from './geminiService.js';
 
-export { AppsScriptServiceError, getAppsScriptEndpointUrl, isAppsScriptConfigured };
+export { AppsScriptServiceError, isAppsScriptConfigured };
 
 /**
  * Searches YouTube educational videos for a single syllabus topic via the
- * backend (`searchTopicVideos` action).
- *
- * Uses same-origin proxy (Netlify / Vercel) when available, falling back
- * gracefully to direct Google Apps Script.
+ * backend (`searchTopicVideos` action) at `/proxy`.
  *
  * @param {{
  *   subject?: string,
@@ -29,7 +25,7 @@ export { AppsScriptServiceError, getAppsScriptEndpointUrl, isAppsScriptConfigure
  *     allowFallbackChannels: boolean,
  *   }
  * }} params
- * @param {{ signal?: AbortSignal, endpointUrl?: string }} [options]
+ * @param {{ signal?: AbortSignal }} [options]
  * @returns {Promise<{
  *   topicName: string,
  *   queryUsed: string,
@@ -60,28 +56,31 @@ export async function searchTopicVideosWithAppsScript(params, options = {}) {
 
   const { response, payload } = await postToBackend(requestBody, options);
 
-  if (!response.ok) {
+  if (!response.ok || !payload || payload.ok !== true) {
     const errCode =
       (typeof payload?.code === 'string' && payload.code.trim()) ||
       (typeof payload?.error?.code === 'string' && payload.error.code.trim()) ||
-      (response.status === 429 ? 'RATE_LIMITED' : response.status >= 500 ? 'NETWORK' : 'UNKNOWN');
+      (response.status === 429
+        ? 'RATE_LIMITED'
+        : response.status === 500
+        ? 'SERVER_NOT_CONFIGURED'
+        : response.status === 502
+        ? 'BACKEND_INVALID_RESPONSE'
+        : response.status >= 500
+        ? 'NETWORK'
+        : 'UNKNOWN');
+
     const errMsg =
       (typeof payload?.message === 'string' && payload.message.trim()) ||
       (typeof payload?.error?.message === 'string' && payload.error.message.trim()) ||
       `Backend YouTube search failed with HTTP status ${response.status}.`;
-    throw new AppsScriptServiceError(errMsg, errCode);
-  }
 
-  if (!payload || typeof payload !== 'object' || payload.ok !== true) {
-    const errCode =
-      (typeof payload?.code === 'string' && payload.code.trim()) ||
-      (typeof payload?.error?.code === 'string' && payload.error.code.trim()) ||
-      'UNKNOWN';
-    const errMsg =
-      (typeof payload?.message === 'string' && payload.message.trim()) ||
-      (typeof payload?.error?.message === 'string' && payload.error.message.trim()) ||
-      'YouTube video search failed.';
-    throw new AppsScriptServiceError(errMsg, errCode);
+    const errDetail =
+      (typeof payload?.detail === 'string' && payload.detail.trim()) ||
+      (typeof payload?.error?.detail === 'string' && payload.error.detail.trim()) ||
+      '';
+
+    throw new AppsScriptServiceError(errMsg, errCode, errDetail);
   }
 
   return {

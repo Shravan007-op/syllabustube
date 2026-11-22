@@ -1,6 +1,3 @@
-import {
-  isAppsScriptConfigured,
-} from '../services/geminiService.js';
 import type {
   StructuredSyllabus,
   StructuredTopic,
@@ -124,10 +121,6 @@ export async function analyzeSyllabusViaApi(
     onProgressiveUpdate?: (mergedSyllabus: StructuredSyllabus) => void;
   }
 ): Promise<StructuredSyllabus> {
-  if (!isAppsScriptConfigured()) {
-    throw new Error('Apps Script URL is not configured. Please check VITE_APPS_SCRIPT_URL.');
-  }
-
   const chunks = splitTextIntoChunks(text);
 
   return processChunksProgressively({

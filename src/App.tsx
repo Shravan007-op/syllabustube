@@ -540,6 +540,12 @@ export default function App() {
                     {analysisError.action}
                   </p>
                 )}
+                {analysisError.detail && (
+                  <details className="text-left text-xs text-text-muted border border-border-subtle rounded p-2 bg-surface-muted/30">
+                    <summary className="cursor-pointer font-medium text-text-main">Details</summary>
+                    <p className="mt-1 font-mono text-[11px] whitespace-pre-wrap">{analysisError.detail}</p>
+                  </details>
+                )}
                 <div className="pt-2 flex justify-center gap-2">
                   <button
                     type="button"

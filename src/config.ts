@@ -30,6 +30,9 @@ export type AppErrorCode =
   | 'ABORTED'
   | 'AUTH_REQUIRED'
   | 'UNAUTHORIZED'
+  | 'INVALID_JSON'
+  | 'BACKEND_INVALID_RESPONSE'
+  | 'SERVER_NOT_CONFIGURED'
   | 'UNKNOWN';
 
 export interface UserFriendlyError {
@@ -37,9 +40,10 @@ export interface UserFriendlyError {
   title: string;
   message: string;
   action: string;
+  detail?: string;
 }
 
-export const ERROR_MAPPINGS: Record<AppErrorCode, Omit<UserFriendlyError, 'code'>> = {
+export const ERROR_MAPPINGS: Record<AppErrorCode, Omit<UserFriendlyError, 'code' | 'detail'>> = {
   FILE_TOO_LARGE: {
     title: 'File Exceeds Size Limit',
     message: `The uploaded document exceeds the ${APP_CONFIG.MAX_FILE_SIZE_MB} MB limit.`,
@@ -72,7 +76,7 @@ export const ERROR_MAPPINGS: Record<AppErrorCode, Omit<UserFriendlyError, 'code'
   },
   NETWORK: {
     title: 'Connection Failed',
-    message: 'Could not connect to the backend server.',
+    message: 'Could not connect to the backend service. Please check your connection and retry.',
     action: 'Check your connection and try again in a few minutes.',
   },
   RATE_LIMITED: {
@@ -106,9 +110,24 @@ export const ERROR_MAPPINGS: Record<AppErrorCode, Omit<UserFriendlyError, 'code'
     action: 'If signed into multiple Google accounts, test in an Incognito window, or ensure the script is deployed to Anyone.',
   },
   UNAUTHORIZED: {
-    title: 'Proxy Secret Mismatch',
-    message: 'The backend rejected the request because PROXY_SECRET is set in Apps Script Script Properties but does not match your website environment.',
-    action: 'Delete PROXY_SECRET from your Apps Script Script Properties, or set the matching PROXY_SECRET in your Vercel Environment Variables.',
+    title: 'Unauthorized',
+    message: 'Invalid or missing proxy secret.',
+    action: 'Check your proxy secret configuration.',
+  },
+  INVALID_JSON: {
+    title: 'Invalid JSON Payload',
+    message: 'Request payload must be valid JSON.',
+    action: 'Please check your input and try again.',
+  },
+  BACKEND_INVALID_RESPONSE: {
+    title: 'Unreadable Backend Response',
+    message: 'The backend returned an unreadable response.',
+    action: 'Please retry shortly.',
+  },
+  SERVER_NOT_CONFIGURED: {
+    title: 'Backend Not Configured',
+    message: 'Backend is not configured.',
+    action: 'Please configure APPS_SCRIPT_URL in Vercel environment variables.',
   },
   UNKNOWN: {
     title: 'Unexpected Error',
@@ -124,38 +143,48 @@ export function resolveUserError(error: unknown): UserFriendlyError {
 
   const rawMessage = error instanceof Error ? error.message : String(error);
   const rawCode = (error as { code?: string }).code || '';
+  const rawDetail = (error as { detail?: string }).detail || '';
 
   // Direct code matches
   if (rawCode in ERROR_MAPPINGS) {
     const code = rawCode as AppErrorCode;
-    return { code, ...ERROR_MAPPINGS[code] };
+    return { code, ...ERROR_MAPPINGS[code], detail: rawDetail };
   }
 
   const lower = rawMessage.toLowerCase();
 
   if (lower.includes('abort') || lower.includes('cancel')) {
-    return { code: 'ABORTED', ...ERROR_MAPPINGS.ABORTED };
+    return { code: 'ABORTED', ...ERROR_MAPPINGS.ABORTED, detail: rawDetail };
   }
   if (lower.includes('exceeds') && lower.includes('mb')) {
-    return { code: 'FILE_TOO_LARGE', ...ERROR_MAPPINGS.FILE_TOO_LARGE };
+    return { code: 'FILE_TOO_LARGE', ...ERROR_MAPPINGS.FILE_TOO_LARGE, detail: rawDetail };
   }
   if (lower.includes('page limit') || lower.includes('too many pages')) {
-    return { code: 'TOO_MANY_PAGES', ...ERROR_MAPPINGS.TOO_MANY_PAGES };
+    return { code: 'TOO_MANY_PAGES', ...ERROR_MAPPINGS.TOO_MANY_PAGES, detail: rawDetail };
   }
   if (lower.includes('unsupported') || lower.includes('format')) {
-    return { code: 'UNSUPPORTED_FILE', ...ERROR_MAPPINGS.UNSUPPORTED_FILE };
+    return { code: 'UNSUPPORTED_FILE', ...ERROR_MAPPINGS.UNSUPPORTED_FILE, detail: rawDetail };
   }
   if (lower.includes('empty text') || lower.includes('no readable text') || lower.includes('too short')) {
-    return { code: 'EMPTY_TEXT', ...ERROR_MAPPINGS.EMPTY_TEXT };
+    return { code: 'EMPTY_TEXT', ...ERROR_MAPPINGS.EMPTY_TEXT, detail: rawDetail };
   }
   if (lower.includes('quota') || lower.includes('resource_exhausted')) {
-    return { code: 'QUOTA_EXCEEDED', ...ERROR_MAPPINGS.QUOTA_EXCEEDED };
+    return { code: 'QUOTA_EXCEEDED', ...ERROR_MAPPINGS.QUOTA_EXCEEDED, detail: rawDetail };
   }
   if (lower.includes('rate') || lower.includes('throttle') || lower.includes('busy') || lower.includes('429')) {
-    return { code: 'RATE_LIMITED', ...ERROR_MAPPINGS.RATE_LIMITED };
+    return { code: 'RATE_LIMITED', ...ERROR_MAPPINGS.RATE_LIMITED, detail: rawDetail };
   }
   if (lower.includes('timeout') || lower.includes('timed out') || lower.includes('deadline')) {
-    return { code: 'TIMEOUT', ...ERROR_MAPPINGS.TIMEOUT };
+    return { code: 'TIMEOUT', ...ERROR_MAPPINGS.TIMEOUT, detail: rawDetail };
+  }
+  if (lower.includes('invalid_json') || lower.includes('malformed json') || lower.includes('valid json')) {
+    return { code: 'INVALID_JSON', ...ERROR_MAPPINGS.INVALID_JSON, detail: rawDetail };
+  }
+  if (lower.includes('unreadable response') || lower.includes('backend_invalid_response')) {
+    return { code: 'BACKEND_INVALID_RESPONSE', ...ERROR_MAPPINGS.BACKEND_INVALID_RESPONSE, detail: rawDetail };
+  }
+  if (lower.includes('not configured') || lower.includes('server_not_configured')) {
+    return { code: 'SERVER_NOT_CONFIGURED', ...ERROR_MAPPINGS.SERVER_NOT_CONFIGURED, detail: rawDetail };
   }
   if (
     lower.includes('ai') ||
@@ -165,13 +194,13 @@ export function resolveUserError(error: unknown): UserFriendlyError {
     lower.includes('schema') ||
     lower.includes('candidate')
   ) {
-    return { code: 'AI_FAILED', ...ERROR_MAPPINGS.AI_FAILED };
+    return { code: 'AI_FAILED', ...ERROR_MAPPINGS.AI_FAILED, detail: rawDetail };
   }
   if (lower.includes('accounts.google.com') || lower.includes('authentication redirect') || lower.includes('html_response')) {
-    return { code: 'AUTH_REQUIRED', ...ERROR_MAPPINGS.AUTH_REQUIRED };
+    return { code: 'AUTH_REQUIRED', ...ERROR_MAPPINGS.AUTH_REQUIRED, detail: rawDetail };
   }
   if (lower.includes('unauthorized') || lower.includes('proxy secret')) {
-    return { code: 'UNAUTHORIZED', ...ERROR_MAPPINGS.UNAUTHORIZED };
+    return { code: 'UNAUTHORIZED', ...ERROR_MAPPINGS.UNAUTHORIZED, detail: rawDetail };
   }
   if (
     lower.includes('network') ||
@@ -180,14 +209,15 @@ export function resolveUserError(error: unknown): UserFriendlyError {
     lower.includes('connect') ||
     lower.includes('offline')
   ) {
-    return { code: 'NETWORK', ...ERROR_MAPPINGS.NETWORK };
+    return { code: 'NETWORK', ...ERROR_MAPPINGS.NETWORK, detail: rawDetail || rawMessage };
   }
   if (lower.includes('ocr') || lower.includes('tesseract')) {
-    return { code: 'OCR_FAILED', ...ERROR_MAPPINGS.OCR_FAILED };
+    return { code: 'OCR_FAILED', ...ERROR_MAPPINGS.OCR_FAILED, detail: rawDetail };
   }
 
   return {
     code: 'UNKNOWN',
     ...ERROR_MAPPINGS.UNKNOWN,
+    detail: rawDetail || rawMessage,
   };
 }
