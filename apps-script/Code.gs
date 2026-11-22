@@ -22,7 +22,7 @@
 
 const APP_CONFIG = {
   SERVICE_NAME: 'SyllabusTube Apps Script Backend',
-  DEFAULT_GEMINI_MODEL: 'gemini-2.5-flash-lite',
+  DEFAULT_GEMINI_MODEL: 'gemini-3.5-flash-lite',
   DEFAULT_GEMINI_FALLBACK_MODEL: 'gemini-2.5-flash',
   MAX_CHARS_PER_CALL: 25000,
   DEFAULT_YOUTUBE_DAILY_BUDGET: 10000,
@@ -683,7 +683,7 @@ function getCandidateGeminiModels_() {
   const pool = [
     customModel,
     customFallback,
-    'gemini-2.5-flash-lite',
+    'gemini-3.5-flash-lite',
     'gemini-2.5-flash',
   ];
 
@@ -694,6 +694,7 @@ function getCandidateGeminiModels_() {
     'gemini-1.5-flash-8b': true,
     'gemini-1.5-pro': true,
     'gemini-1.5-pro-latest': true,
+    'gemini-2.5-flash-lite': true,
   };
 
   for (let i = 0; i < pool.length; i++) {
@@ -702,7 +703,7 @@ function getCandidateGeminiModels_() {
       unique.push(m);
     }
   }
-  return unique.length > 0 ? unique : ['gemini-2.5-flash-lite'];
+  return unique.length > 0 ? unique : ['gemini-3.5-flash-lite'];
 }
 
 function callGeminiWithAutoModelFallback_(requestBody) {
