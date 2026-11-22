@@ -49,23 +49,41 @@ function getClientIp(req) {
   return req.socket?.remoteAddress || 'unknown';
 }
 
+function sanitizeForLog(value) {
+  let text = String(value ?? '');
+  const proxySecret = process.env.PROXY_SECRET ? process.env.PROXY_SECRET.trim() : '';
+  if (proxySecret) {
+    text = text.split(proxySecret).join('[REDACTED_SECRET]');
+  }
+  text = text.replace(/AIza[0-9A-Za-z_-]{20,}/g, '[REDACTED_API_KEY]');
+  return text;
+}
+
 function resolveAllowedOrigin(reqOrigin) {
-  const configured = process.env.ALLOWED_ORIGIN;
+  const configured = process.env.ALLOWED_ORIGIN || process.env.ALLOWED_ORIGINS;
   if (!configured || configured.trim() === '*' || configured.trim() === '') {
     return reqOrigin || '*';
   }
-  const allowed = configured.split(',').map((o) => o.trim().toLowerCase());
+  const allowed = configured
+    .split(',')
+    .map((o) => o.trim().toLowerCase())
+    .filter(Boolean);
+  if (allowed.includes('*')) {
+    return reqOrigin || '*';
+  }
   if (reqOrigin && allowed.includes(reqOrigin.toLowerCase())) {
     return reqOrigin;
   }
-  return allowed[0] || '*';
+  return '';
 }
 
 export default async function handler(req, res) {
   const origin = req.headers.origin;
   const allowedOrigin = resolveAllowedOrigin(origin);
 
-  res.setHeader('Access-Control-Allow-Origin', allowedOrigin);
+  if (allowedOrigin) {
+    res.setHeader('Access-Control-Allow-Origin', allowedOrigin);
+  }
   res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, X-Proxy-Secret');
   res.setHeader('Vary', 'Origin');
@@ -89,7 +107,7 @@ export default async function handler(req, res) {
   // 1. Sliding window burst rate limit (per minute)
   const clientIp = getClientIp(req);
   if (!checkBurstRateLimit(clientIp)) {
-    console.error(`[Proxy Error] RATE_LIMITED: Burst limit exceeded for IP ${clientIp}`);
+    console.error(`[Proxy Error] RATE_LIMITED: Burst limit exceeded for IP ${sanitizeForLog(clientIp)}`);
     return res.status(429).json({
       ok: false,
       code: 'RATE_LIMITED',
@@ -101,15 +119,25 @@ export default async function handler(req, res) {
     });
   }
 
-  const scriptUrl =
-    process.env.VITE_APPS_SCRIPT_URL ||
-    'https://script.google.com/macros/s/AKfycbwPiLzm4X9unGh8YmHeKUIs-XE9O6Jq6E5q239LNTVE9uNOjt7QQY5A4OTxYbCb7exy/exec';
+  const scriptUrl = (process.env.APPS_SCRIPT_URL || process.env.VITE_APPS_SCRIPT_URL || '').trim();
+  if (!scriptUrl) {
+    console.error(`[Proxy Error] SERVER_NOT_CONFIGURED: Missing APPS_SCRIPT_URL environment variable (IP: ${sanitizeForLog(clientIp)})`);
+    return res.status(500).json({
+      ok: false,
+      code: 'SERVER_NOT_CONFIGURED',
+      message: 'Backend is not configured.',
+      error: {
+        code: 'SERVER_NOT_CONFIGURED',
+        message: 'Backend is not configured.',
+      },
+    });
+  }
 
   try {
     let payload = {};
     if (typeof req.body === 'string') {
-      if (req.body.length > MAX_BODY_SIZE_BYTES) {
-        console.error(`[Proxy Error] FILE_TOO_LARGE from IP ${clientIp}`);
+      if (Buffer.byteLength(req.body, 'utf8') > MAX_BODY_SIZE_BYTES) {
+        console.error(`[Proxy Error] FILE_TOO_LARGE from IP ${sanitizeForLog(clientIp)}`);
         return res.status(413).json({
           ok: false,
           code: 'FILE_TOO_LARGE',
@@ -123,13 +151,13 @@ export default async function handler(req, res) {
       try {
         payload = JSON.parse(req.body);
       } catch {
-        console.error(`[Proxy Error] INVALID_JSON from IP ${clientIp}`);
+        console.error(`[Proxy Error] INVALID_JSON from IP ${sanitizeForLog(clientIp)}`);
         return res.status(400).json({
           ok: false,
-          code: 'AI_FAILED',
+          code: 'INVALID_JSON',
           message: 'Request payload must be valid JSON.',
           error: {
-            code: 'AI_FAILED',
+            code: 'INVALID_JSON',
             message: 'Request payload must be valid JSON.',
           },
         });
@@ -142,7 +170,7 @@ export default async function handler(req, res) {
 
     // Input validation
     if (!payload || typeof payload !== 'object' || typeof payload.action !== 'string') {
-      console.error(`[Proxy Error] INVALID_PAYLOAD from IP ${clientIp}`);
+      console.error(`[Proxy Error] INVALID_PAYLOAD from IP ${sanitizeForLog(clientIp)}`);
       return res.status(400).json({
         ok: false,
         code: 'UNKNOWN',
@@ -190,11 +218,27 @@ export default async function handler(req, res) {
       parsed = JSON.parse(rawData);
     } catch (e) {}
 
+    if (!parsed || typeof parsed !== 'object') {
+      const sanitizedSnippet = sanitizeForLog(rawData).slice(0, 200);
+      console.error(
+        `[Proxy Upstream Error] IP: ${sanitizeForLog(clientIp)} | Action: ${sanitizeForLog(payload.action)} | Code: BACKEND_INVALID_RESPONSE | Status: ${response.status} | Body: ${sanitizedSnippet}`
+      );
+      return res.status(502).json({
+        ok: false,
+        code: 'BACKEND_INVALID_RESPONSE',
+        message: 'The backend returned an unreadable response.',
+        error: {
+          code: 'BACKEND_INVALID_RESPONSE',
+          message: 'The backend returned an unreadable response.',
+        },
+      });
+    }
+
     // Check if backend returned RATE_LIMITED due to onlyIfCached or daily cap
     const backendCode = parsed?.code || parsed?.error?.code;
     if (parsed && !parsed.ok && backendCode === 'RATE_LIMITED') {
       const resetTime = getUtcMidnightIso();
-      console.error(`[Proxy Error] RATE_LIMITED: Daily cap reached for IP ${clientIp}`);
+      console.error(`[Proxy Error] RATE_LIMITED: Daily cap reached for IP ${sanitizeForLog(clientIp)}`);
       return res.status(429).json({
         ok: false,
         code: 'RATE_LIMITED',
@@ -209,15 +253,15 @@ export default async function handler(req, res) {
     }
 
     if (parsed && !parsed.ok) {
-      const errCode = parsed.code || parsed.error?.code || 'UNKNOWN';
-      const errMsg = parsed.message || parsed.error?.message || 'Upstream backend error';
-      console.error(`[Proxy Upstream Error] IP: ${clientIp} | Action: ${payload.action} | Code: ${errCode} | Detail: ${errMsg}`);
+      const errCode = sanitizeForLog(parsed.code || parsed.error?.code || 'UNKNOWN');
+      const errMsg = sanitizeForLog(parsed.message || parsed.error?.message || 'Upstream backend error');
+      console.error(`[Proxy Upstream Error] IP: ${sanitizeForLog(clientIp)} | Action: ${sanitizeForLog(payload.action)} | Code: ${errCode} | Detail: ${errMsg}`);
     }
 
     // Server-side logging of quota telemetry
     if (parsed && parsed.telemetry) {
       console.log(
-        `[SyllabusTube Telemetry] IP: ${clientIp} | Action: ${payload.action} | Gemini calls: ${parsed.telemetry.geminiCallsUsed || 0} | Est. YouTube units: ${parsed.telemetry.estimatedYoutubeUnitsUsed || 0} | Cached: ${Boolean(parsed.telemetry.cached)}`
+        `[SyllabusTube Telemetry] IP: ${sanitizeForLog(clientIp)} | Action: ${sanitizeForLog(payload.action)} | Gemini calls: ${parsed.telemetry.geminiCallsUsed || 0} | Est. YouTube units: ${parsed.telemetry.estimatedYoutubeUnitsUsed || 0} | Cached: ${Boolean(parsed.telemetry.cached)}`
       );
     }
 
@@ -226,13 +270,13 @@ export default async function handler(req, res) {
     if (isAnalysisAction && parsed && parsed.ok && !isCacheHit) {
       dailyGlobalMap.set(todayKey, currentGlobal + 1);
       dailyIpMap.set(ipKey, currentIp + 1);
-      console.log(`[SyllabusTube Daily Usage] Global: ${currentGlobal + 1}/${globalCap} | IP (${clientIp}): ${currentIp + 1}/${ipCap}`);
+      console.log(`[SyllabusTube Daily Usage] Global: ${currentGlobal + 1}/${globalCap} | IP (${sanitizeForLog(clientIp)}): ${currentIp + 1}/${ipCap}`);
     }
 
     res.setHeader('Content-Type', 'application/json');
     return res.status(200).send(rawData);
   } catch (err) {
-    console.error(`[Proxy Network Error] IP: ${clientIp} | Detail: ${err?.message || 'Failed to connect'}`);
+    console.error(`[Proxy Network Error] IP: ${sanitizeForLog(clientIp)} | Detail: ${sanitizeForLog(err?.message || 'Failed to connect')}`);
     return res.status(502).json({
       ok: false,
       code: 'NETWORK',

@@ -22,7 +22,7 @@
 
 const APP_CONFIG = {
   SERVICE_NAME: 'SyllabusTube Apps Script Backend',
-  DEFAULT_GEMINI_MODEL: 'gemini-1.5-flash',
+  DEFAULT_GEMINI_MODEL: 'gemini-2.5-flash-lite',
   DEFAULT_GEMINI_FALLBACK_MODEL: 'gemini-2.5-flash',
   MAX_CHARS_PER_CALL: 25000,
   DEFAULT_YOUTUBE_DAILY_BUDGET: 10000,
@@ -623,7 +623,27 @@ function handleAnalyseSyllabus_(payload) {
         const rawJsonText = extractGeminiTextOutput_(apiResponse);
         structured = parseAndValidateSyllabusJson_(rawJsonText);
       } catch (singleErr) {
-        console.warn('Single-call structuring failed or took too long, falling back to unit splitting: ' + (singleErr ? singleErr.message : ''));
+        const singleErrCode = singleErr && singleErr.code ? String(singleErr.code) : 'UNKNOWN';
+        const singleErrMsg = sanitizeErrorMessage_(
+          singleErr && singleErr.message ? String(singleErr.message) : '',
+          getOptionalScriptProperty_('GEMINI_API_KEY')
+        );
+        const canonicalSingleCode = normalizeCanonicalErrorCode_(singleErrCode, singleErrMsg);
+        if (
+          singleErrCode === 'RATE_LIMITED' ||
+          singleErrCode === 'QUOTA_EXCEEDED' ||
+          canonicalSingleCode === 'RATE_LIMITED' ||
+          canonicalSingleCode === 'QUOTA_EXCEEDED'
+        ) {
+          throw singleErr;
+        }
+        console.warn(
+          'Single-call structuring failed [' +
+            singleErrCode +
+            ']: ' +
+            (singleErrMsg || 'Unknown error') +
+            ', falling back to unit splitting.'
+        );
       }
     }
 
@@ -663,16 +683,17 @@ function getCandidateGeminiModels_() {
   const pool = [
     customModel,
     customFallback,
-    'gemini-1.5-flash',
-    'gemini-2.5-flash',
-    'gemini-1.5-flash-latest',
     'gemini-2.5-flash-lite',
+    'gemini-2.5-flash',
   ];
 
   const unique = [];
   const invalidModels = {
-    'gemini-2.0-flash': true,
+    'gemini-1.5-flash': true,
+    'gemini-1.5-flash-latest': true,
     'gemini-1.5-flash-8b': true,
+    'gemini-1.5-pro': true,
+    'gemini-1.5-pro-latest': true,
   };
 
   for (let i = 0; i < pool.length; i++) {
@@ -681,7 +702,7 @@ function getCandidateGeminiModels_() {
       unique.push(m);
     }
   }
-  return unique.length > 0 ? unique : ['gemini-1.5-flash'];
+  return unique.length > 0 ? unique : ['gemini-2.5-flash-lite'];
 }
 
 function callGeminiWithAutoModelFallback_(requestBody) {
@@ -743,6 +764,9 @@ function buildGeminiSyllabusRequestBody_(syllabusText, sourceFileName) {
     generationConfig: {
       responseMimeType: 'application/json',
       responseSchema: SYLLABUS_RESPONSE_SCHEMA,
+      thinkingConfig: {
+        thinkingBudget: 0,
+      },
     },
   };
 }
@@ -948,6 +972,16 @@ function callGeminiWithRetry_(model, apiKey, requestBody) {
       }
     }
 
+    const sanitizedBodySnippet = sanitizeErrorMessage_(responseBodyText, apiKey).slice(0, 200);
+    console.warn(
+      '[Gemini Retry Warning] Model: ' +
+        model +
+        ' | HTTP ' +
+        upstreamStatus +
+        ' | Body: ' +
+        sanitizedBodySnippet
+    );
+
     lastUpstreamStatus = upstreamStatus;
     lastErrorMessage = extractUpstreamGeminiError_(responseBodyText, upstreamStatus, apiKey);
 
@@ -1031,6 +1065,9 @@ function extractGeminiTextOutput_(apiResponse) {
       : [];
   let concatenatedText = '';
   for (let i = 0; i < parts.length; i++) {
+    if (parts[i] && parts[i].thought === true) {
+      continue;
+    }
     if (parts[i] && typeof parts[i].text === 'string') {
       concatenatedText += parts[i].text;
     }
@@ -2465,6 +2502,7 @@ function errorOutput_(err) {
     ok: false,
     code: canonicalCode,
     message: safeMessage,
+    detail: sanitizedDetail,
     error: {
       code: canonicalCode,
       message: safeMessage,
